@@ -189,6 +189,15 @@ public:
     bool is_closed() const {
         return closed_.load(std::memory_order_acquire);
     }
+
+    // Sleep for up to `timeout`, returning early if close() is called.
+    // Returns true if dispatcher was closed during the wait, false on timeout.
+    bool wait_for_close(const std::chrono::milliseconds& timeout) {
+        std::unique_lock<std::mutex> lk(m_);
+        return cv_.wait_for(lk, timeout, [this] {
+            return closed_.load(std::memory_order_acquire);
+        });
+    }
     
     // Get the last activity time
     std::chrono::steady_clock::time_point last_activity() const {

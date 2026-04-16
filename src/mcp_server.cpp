@@ -214,74 +214,27 @@ void server::stop() {
     // Give threads some time to handle close events
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     
-    // Wait for threads to finish outside the lock (with timeout limit)
-    const auto timeout_point = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    
+    // Join all SSE threads unconditionally. We already closed their dispatchers
+    // above, which wakes them from wait_event / wait_for_close immediately,
+    // so join should complete within milliseconds. Detach is never safe here
+    // because the threads access server state (e.g. via close_session) and
+    // would cause use-after-free if they outlive the server.
     for (auto& thread : threads_to_join) {
-        if (!thread || !thread->joinable()) {
-            continue;
-        }
-        
-        if (std::chrono::steady_clock::now() >= timeout_point) {
-            // If timeout reached, detach remaining threads
-            LOG_WARNING("Thread join timeout reached, detaching remaining threads");
-            thread->detach();
-            continue;
-        }
-        
-        // Try using timeout join
-        bool joined = false;
-        try {
-            // Create future and promise for timeout join
-            std::promise<void> thread_done;
-            auto future = thread_done.get_future();
-            
-            // Try join in another thread
-            std::thread join_helper([&thread, &thread_done]() {
-                try {
-                    thread->join();
-                    thread_done.set_value();
-                } catch (...) {
-                    try {
-                        thread_done.set_exception(std::current_exception());
-                    } catch (...) {}
-                }
-            });
-            
-            // Wait for join to complete or timeout
-            if (future.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready) {
-                future.get(); // Get possible exception
-                joined = true;
-            }
-            
-            // Process join_helper thread
-            if (join_helper.joinable()) {
-                if (joined) {
-                    join_helper.join();
-                } else {
-                    join_helper.detach();
-                }
-            }
-        } catch (...) {
-            joined = false;
-        }
-        
-        // If join fails, then detach
-        if (!joined) {
+        if (thread && thread->joinable()) {
             try {
-                thread->detach();
-            } catch (...) {
-                // Ignore exceptions
+                thread->join();
+            } catch (const std::exception& e) {
+                LOG_ERROR("Failed to join SSE thread: ", e.what());
             }
         }
     }
-    
+
     if (server_thread_ && server_thread_->joinable()) {
         http_server_->stop();
         try {
             server_thread_->join();
-        } catch (...) {
-            server_thread_->detach();
+        } catch (const std::exception& e) {
+            LOG_ERROR("Failed to join server thread: ", e.what());
         }
     } else {
         http_server_->stop();
@@ -727,11 +680,20 @@ void server::handle_sse(const httplib::Request& req, httplib::Response& res) {
             // Update activity time (after sending message)
             session_dispatcher->update_activity();
             
-            // Send periodic heartbeats to detect connection status
+            // Send periodic heartbeats to detect connection status. Use an
+            // interruptible wait so server::stop() (which calls dispatcher
+            // close()) can wake this thread immediately — previously a naked
+            // sleep_for(5s) meant stop() had to either wait up to 5s or
+            // detach the thread (hazardous: detached thread outlives server
+            // and crashes on use-after-free).
             int heartbeat_count = 0;
             while (running_ && !session_dispatcher->is_closed()) {
-               std::this_thread::sleep_for(std::chrono::seconds(5) + std::chrono::milliseconds(rand() % 500)); // NOTE: DO NOT set it the same as the timeout of wait_event
-                
+                auto timeout = std::chrono::seconds(5) +
+                               std::chrono::milliseconds(rand() % 500);
+                if (session_dispatcher->wait_for_close(timeout)) {
+                    break; // Dispatcher closed — exit cleanly
+                }
+
                 if (session_dispatcher->is_closed() || !running_) {
                     break;
                 }
