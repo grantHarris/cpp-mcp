@@ -359,6 +359,18 @@ TEST_F(ServerTest, BatchRequest) {
     EXPECT_TRUE(status == 200);
 }
 
+TEST_F(ServerTest, RejectInitializeInBatch) {
+    json batch = json::array({
+        {{"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"},
+         {"params", {{"protocolVersion", MCP_VERSION},
+                     {"clientInfo", {{"name", "Bad"}, {"version", "1.0"}}},
+                     {"capabilities", json::object()}}}},
+        {{"jsonrpc", "2.0"}, {"id", 2}, {"method", "ping"}}
+    });
+    auto res = mcp_post(*cli_, "/mcp", batch);
+    EXPECT_EQ(res["_status"], 400);
+}
+
 // ===========================================================================
 // Tools via Streamable HTTP
 // ===========================================================================
