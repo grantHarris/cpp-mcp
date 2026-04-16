@@ -243,6 +243,21 @@ protected:
                         {"text", "{\"id\":\"" + params.at("id") + "\"}"}};
             });
 
+        // Register a prompt
+        prompt greet_prompt;
+        greet_prompt.name = "greet";
+        greet_prompt.description = "Generate a greeting";
+        greet_prompt.arguments = {{"name", "Name to greet", true}};
+        srv_->register_prompt(greet_prompt, [](const json& args, const std::string&) -> json {
+            std::string name = args.value("name", "world");
+            return {
+                {"description", "A greeting"},
+                {"messages", json::array({
+                    {{"role", "user"}, {"content", {{"type", "text"}, {"text", "Say hello to " + name}}}}
+                })}
+            };
+        });
+
         srv_->start(false);
         // Give the server a moment to bind
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -523,6 +538,39 @@ TEST_F(ServerTest, BroadcastLog) {
 
     // broadcast_log shouldn't crash
     EXPECT_NO_THROW(srv_->broadcast_log("info", "test", "Hello from test"));
+}
+
+// ===========================================================================
+// Prompts via Streamable HTTP
+// ===========================================================================
+
+TEST_F(ServerTest, PromptsList) {
+    auto [sid, _] = mcp_initialize(*cli_);
+    json req = {{"jsonrpc", "2.0"}, {"id", 40}, {"method", "prompts/list"},
+                {"params", json::object()}};
+    auto res = mcp_post(*cli_, "/mcp", req, sid);
+    auto prompts = res["_body"]["result"]["prompts"];
+    ASSERT_EQ(prompts.size(), 1);
+    EXPECT_EQ(prompts[0]["name"], "greet");
+    EXPECT_TRUE(prompts[0].contains("arguments"));
+}
+
+TEST_F(ServerTest, PromptsGet) {
+    auto [sid, _] = mcp_initialize(*cli_);
+    json req = {{"jsonrpc", "2.0"}, {"id", 41}, {"method", "prompts/get"},
+                {"params", {{"name", "greet"}, {"arguments", {{"name", "Alice"}}}}}};
+    auto res = mcp_post(*cli_, "/mcp", req, sid);
+    auto messages = res["_body"]["result"]["messages"];
+    ASSERT_FALSE(messages.empty());
+    EXPECT_EQ(messages[0]["role"], "user");
+}
+
+TEST_F(ServerTest, PromptsGetNotFound) {
+    auto [sid, _] = mcp_initialize(*cli_);
+    json req = {{"jsonrpc", "2.0"}, {"id", 42}, {"method", "prompts/get"},
+                {"params", {{"name", "nonexistent"}}}};
+    auto res = mcp_post(*cli_, "/mcp", req, sid);
+    EXPECT_TRUE(res["_body"].contains("error"));
 }
 
 // ===========================================================================
