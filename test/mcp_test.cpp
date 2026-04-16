@@ -562,6 +562,30 @@ TEST_F(ServerTest, SseEndpointReturnsEventStream) {
 }
 
 // ===========================================================================
+// Progress & Cancellation
+// ===========================================================================
+
+TEST_F(ServerTest, CancellationTracking) {
+    auto [sid, _] = mcp_initialize(*cli_);
+
+    // Send a cancellation notification for request ID 42
+    json cancel = {{"jsonrpc", "2.0"}, {"method", "notifications/cancelled"},
+                   {"params", {{"requestId", 42}, {"reason", "User abort"}}}};
+    auto res = mcp_post(*cli_, "/mcp", cancel, sid);
+    EXPECT_EQ(res["_status"], 202);
+
+    // Server should now report that request 42 is cancelled
+    EXPECT_TRUE(srv_->is_cancelled(42, sid));
+    EXPECT_FALSE(srv_->is_cancelled(99, sid));
+}
+
+TEST_F(ServerTest, SendProgress) {
+    auto [sid, _] = mcp_initialize(*cli_);
+    // Just verify send_progress doesn't crash — actual delivery requires SSE stream
+    EXPECT_NO_THROW(srv_->send_progress(sid, "token-abc", 50, 100, "Half done"));
+}
+
+// ===========================================================================
 // SSE Client Integration (uses sse_client class)
 // NOTE: sse_client teardown has a known segfault in thread cleanup.
 // These tests are disabled by default until the SSE client is fixed.
