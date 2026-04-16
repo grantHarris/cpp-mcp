@@ -502,6 +502,30 @@ TEST_F(ServerTest, ResourceTemplateList) {
 }
 
 // ===========================================================================
+// Logging Protocol
+// ===========================================================================
+
+TEST_F(ServerTest, LoggingSetLevel) {
+    auto [sid, _] = mcp_initialize(*cli_);
+    json req = {{"jsonrpc", "2.0"}, {"id", 30}, {"method", "logging/setLevel"},
+                {"params", {{"level", "debug"}}}};
+    auto res = mcp_post(*cli_, "/mcp", req, sid);
+    EXPECT_EQ(res["_status"], 200);
+    EXPECT_EQ(res["_body"]["result"], json::object());
+}
+
+TEST_F(ServerTest, BroadcastLog) {
+    auto [sid, _] = mcp_initialize(*cli_);
+    // Set level to debug so all messages pass
+    json req = {{"jsonrpc", "2.0"}, {"id", 31}, {"method", "logging/setLevel"},
+                {"params", {{"level", "debug"}}}};
+    mcp_post(*cli_, "/mcp", req, sid);
+
+    // broadcast_log shouldn't crash
+    EXPECT_NO_THROW(srv_->broadcast_log("info", "test", "Hello from test"));
+}
+
+// ===========================================================================
 // CORS Headers
 // ===========================================================================
 
