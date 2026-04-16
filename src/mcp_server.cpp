@@ -1093,6 +1093,18 @@ json server::process_request(const request& req, const std::string& session_id) 
             return handle_initialize(req, session_id);
         } else if (req.method == "ping") {
             return response::create_success(req.id, json::object()).to_json();
+        } else if (req.method == "logging/setLevel") {
+            if (!req.params.contains("level")) {
+                return response::create_error(req.id, error_code::invalid_params,
+                    "Missing 'level' parameter").to_json();
+            }
+            std::string level = req.params["level"].get<std::string>();
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                session_log_levels_[session_id] = level;
+            }
+            LOG_INFO("Session ", session_id, " set log level to: ", level);
+            return response::create_success(req.id, json::object()).to_json();
         }
 
         if (!is_session_initialized(session_id)) {
@@ -1277,6 +1289,53 @@ void server::broadcast_notification(const request& notification) {
     }
 }
 
+// Log level ordering per MCP spec (syslog severity)
+static int log_level_severity(const std::string& level) {
+    if (level == "emergency") return 0;
+    if (level == "alert") return 1;
+    if (level == "critical") return 2;
+    if (level == "error") return 3;
+    if (level == "warning") return 4;
+    if (level == "notice") return 5;
+    if (level == "info") return 6;
+    if (level == "debug") return 7;
+    return 4; // default to warning
+}
+
+void server::send_log(const std::string& session_id, const std::string& level,
+                      const std::string& logger, const json& data) {
+    // Check if session accepts this log level
+    std::string session_level;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = session_log_levels_.find(session_id);
+        session_level = (it != session_log_levels_.end()) ? it->second : "warning";
+    }
+    if (log_level_severity(level) > log_level_severity(session_level)) {
+        return; // Level too verbose for this session
+    }
+
+    json params = {{"level", level}, {"logger", logger}, {"data", data}};
+    auto notif = request::create_notification("message");
+    notif.params = params;
+    send_jsonrpc(session_id, notif.to_json());
+}
+
+void server::broadcast_log(const std::string& level, const std::string& logger, const json& data) {
+    std::vector<std::string> sessions;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& [sid, initialized] : session_initialized_) {
+            if (initialized) sessions.push_back(sid);
+        }
+    }
+    for (const auto& sid : sessions) {
+        try {
+            send_log(sid, level, logger, data);
+        } catch (...) {}
+    }
+}
+
 std::vector<std::string> server::get_active_sessions() const {
     std::vector<std::string> sessions;
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1423,8 +1482,9 @@ void server::close_session(const std::string& session_id) {
                 sse_threads_.erase(thread_it);
             }
             
-            // Clean up initialization status
+            // Clean up initialization status and log level
             session_initialized_.erase(session_id);
+            session_log_levels_.erase(session_id);
         }
         
         // Close dispatcher outside the lock

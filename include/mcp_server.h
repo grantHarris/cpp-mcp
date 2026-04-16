@@ -377,6 +377,25 @@ public:
     std::vector<std::string> get_active_sessions() const;
 
     /**
+     * @brief Send a log message to a specific client session
+     * @param session_id The session ID to send to
+     * @param level Log level: "debug", "info", "notice", "warning", "error", "critical", "alert", "emergency"
+     * @param logger Logger name (e.g. component identifier)
+     * @param data Log message string or structured JSON data
+     * @note Only sent if the session's log level (set via logging/setLevel) allows it
+     */
+    void send_log(const std::string& session_id, const std::string& level,
+                  const std::string& logger, const json& data);
+
+    /**
+     * @brief Broadcast a log message to all initialized sessions that accept this level
+     * @param level Log level
+     * @param logger Logger name
+     * @param data Log message string or structured JSON data
+     */
+    void broadcast_log(const std::string& level, const std::string& logger, const json& data);
+
+    /**
      * @brief Set mount point for server
      * @param mount_point The mount point to set
      * @param dir The directory to serve from the mount point
@@ -437,7 +456,10 @@ private:
     
     // Authentication handler
     auth_handler auth_handler_;
-    
+
+    // Per-session log level (session_id -> level string, default "warning")
+    std::map<std::string, std::string> session_log_levels_;
+
     // Mutex for thread safety
     mutable std::mutex mutex_;
     
