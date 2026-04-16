@@ -1623,53 +1623,59 @@ bool server::set_mount_point(const std::string& mount_point, const std::string& 
 }
 
 void server::close_session(const std::string& session_id) {
-     // Clean up resources safely
-    try {
-        for (const auto& [key, handler] : session_cleanup_handler_) {
-            handler(key);
+    // Snapshot state under lock. Idempotent: second concurrent caller finds
+    // nothing to clean up and returns silently. Thread ownership stays in
+    // sse_threads_ so server::stop() can join on shutdown.
+    std::shared_ptr<event_dispatcher> dispatcher_to_close;
+    std::map<std::string, session_cleanup_handler> cleanup_handlers_copy;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto dispatcher_it = session_dispatchers_.find(session_id);
+        if (dispatcher_it == session_dispatchers_.end()) {
+            // Already cleaned up by another caller — nothing to do.
+            return;
         }
 
-        // Copy resources to be processed
-        std::shared_ptr<event_dispatcher> dispatcher_to_close;
-        std::unique_ptr<std::thread> thread_to_release;
-        
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            
-            // Get dispatcher pointer
-            auto dispatcher_it = session_dispatchers_.find(session_id);
-            if (dispatcher_it != session_dispatchers_.end()) {
-                dispatcher_to_close = dispatcher_it->second;
-                session_dispatchers_.erase(dispatcher_it);
-            }
-            
-            // Get thread pointer
-            auto thread_it = sse_threads_.find(session_id);
-            if (thread_it != sse_threads_.end()) {
-                thread_to_release = std::move(thread_it->second);
-                sse_threads_.erase(thread_it);
-            }
-            
-            // Clean up initialization status, log level, and cancelled requests
-            session_initialized_.erase(session_id);
-            session_log_levels_.erase(session_id);
-            cancelled_requests_.erase(session_id);
-        }
-        
-        // Close dispatcher outside the lock
-        if (dispatcher_to_close && !dispatcher_to_close->is_closed()) {
-            dispatcher_to_close->close();
-        }
-        
-        // Release thread resources
-        if (thread_to_release) {
-            thread_to_release.release();
-        }
-    } catch (const std::exception& e) {
-        LOG_WARNING("Exception while cleaning up session resources: ", session_id, ", ", e.what());
-    } catch (...) {
-        LOG_WARNING("Unknown exception while cleaning up session resources: ", session_id);
+        dispatcher_to_close = dispatcher_it->second;
+        session_dispatchers_.erase(dispatcher_it);
+
+        session_initialized_.erase(session_id);
+        session_log_levels_.erase(session_id);
+        cancelled_requests_.erase(session_id);
+
+        // Copy cleanup handlers so we can invoke them without holding the lock.
+        cleanup_handlers_copy = session_cleanup_handler_;
     }
+
+    // Close dispatcher outside the lock so threads waiting in wait_event
+    // can wake immediately without contending for mutex_.
+    if (dispatcher_to_close && !dispatcher_to_close->is_closed()) {
+        dispatcher_to_close->close();
+    }
+
+    // Invoke cleanup handlers outside the lock. Handlers may do arbitrary
+    // work including callbacks that re-enter the server; holding mutex_
+    // would deadlock.
+    try {
+        for (const auto& [key, handler] : cleanup_handlers_copy) {
+            try {
+                handler(key);
+            } catch (const std::exception& e) {
+                LOG_WARNING("Session cleanup handler threw: ", session_id, ", ", e.what());
+            } catch (...) {
+                LOG_WARNING("Session cleanup handler threw unknown exception: ", session_id);
+            }
+        }
+    } catch (...) {
+        // Defensive — the inner try/catch should have caught everything.
+    }
+
+    // NOTE: we intentionally do NOT touch sse_threads_ here. The heartbeat
+    // thread may itself be calling close_session during its own exit, so we
+    // can't join from within it. server::stop() drains and joins all
+    // entries in sse_threads_ on shutdown.
 }
 
 } // namespace mcp
