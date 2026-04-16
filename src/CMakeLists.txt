@@ -16,6 +16,17 @@ add_library(${TARGET} STATIC
     ../include/mcp_sse_client.h
 )
 
+# Defaults when included as a subdirectory without the top-level CMakeLists.txt
+if(NOT DEFINED MCP_MAX_SESSIONS)
+    set(MCP_MAX_SESSIONS 10)
+endif()
+if(NOT DEFINED MCP_SESSION_TIMEOUT)
+    set(MCP_SESSION_TIMEOUT 30)
+endif()
+if(NOT DEFINED MCP_SSE_KEEPALIVE_MS)
+    set(MCP_SSE_KEEPALIVE_MS 30000)
+endif()
+
 target_compile_definitions(${TARGET} PUBLIC
     MCP_MAX_SESSIONS=${MCP_MAX_SESSIONS}
     MCP_SESSION_TIMEOUT=${MCP_SESSION_TIMEOUT}
