@@ -439,43 +439,41 @@ void sse_client::close_sse_connection() {
         LOG_INFO("SSE connection already closed");
         return;
     }
-    
+
     LOG_INFO("Actively closing SSE connection (normal exit flow)...");
-    
+
     sse_running_ = false;
-    
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    
-    if (sse_thread_ && sse_thread_->joinable()) {
-        auto timeout = std::chrono::seconds(5);
-        auto start = std::chrono::steady_clock::now();
-        
-        LOG_INFO("Waiting for SSE thread to end...");
-        
-        while (sse_thread_->joinable() && 
-            std::chrono::steady_clock::now() - start < timeout) {
-            try {
-                sse_thread_->join();
-                LOG_INFO("SSE thread successfully ended");
-                break;
-            } catch (const std::exception& e) {
-                LOG_ERROR("Error waiting for SSE thread: ", e.what());
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-        }
-        
-        if (sse_thread_->joinable()) {
-            LOG_WARNING("SSE thread did not end within timeout, detaching thread");
-            sse_thread_->detach();
+
+    // Forcibly abort any in-flight Get() in the SSE thread so it can observe
+    // sse_running_ = false and exit immediately. Without this, the thread
+    // blocks inside httplib::Client::Get until the server sends data or the
+    // read timeout fires.
+    if (sse_client_) {
+        try {
+            sse_client_->stop();
+        } catch (...) {
+            // Best effort — keep going even if stop() throws
         }
     }
-    
+
+    // Never detach: a detached thread can run past our destructor and access
+    // freed members (segfault). Always wait for the thread to exit.
+    if (sse_thread_ && sse_thread_->joinable()) {
+        LOG_INFO("Waiting for SSE thread to end...");
+        try {
+            sse_thread_->join();
+            LOG_INFO("SSE thread successfully ended");
+        } catch (const std::exception& e) {
+            LOG_ERROR("Error waiting for SSE thread: ", e.what());
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lock(mutex_);
         msg_endpoint_.clear();
         endpoint_cv_.notify_all();
     }
-    
+
     LOG_INFO("SSE connection successfully closed (normal exit flow)");
 }
 
