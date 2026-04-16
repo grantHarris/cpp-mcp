@@ -33,6 +33,7 @@ find_package(Threads REQUIRED)
 option(MCP_SSL "Enable SSL support" OFF)
 set(MCP_MAX_SESSIONS 10 CACHE STRING "Maximum concurrent MCP sessions (0 = unlimited)")
 set(MCP_SESSION_TIMEOUT 30 CACHE STRING "Inactive session timeout in seconds (0 = disabled)")
+set(MCP_SSE_KEEPALIVE_MS 30000 CACHE STRING "SSE keepalive timeout in milliseconds")
 
 if(MCP_SSL)
     find_package(OpenSSL 3.0.0 COMPONENTS Crypto SSL REQUIRED)
