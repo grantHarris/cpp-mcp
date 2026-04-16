@@ -166,7 +166,12 @@ public:
             message_ = message;
             
             cid_.store(id_.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
-            cv_.notify_one(); // Notify waiting threads
+            // notify_all — multiple threads may wait on cv_ (wait_event +
+            // wait_for_close) with different predicates. notify_one could
+            // wake the "wrong" thread (e.g. a heartbeat sleeper), which
+            // sees its predicate is still false and goes back to sleep,
+            // starving the thread that actually needed the signal.
+            cv_.notify_all();
             return true;
         } catch (...) {
             return false;
