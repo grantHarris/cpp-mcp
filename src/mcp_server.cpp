@@ -179,16 +179,16 @@ void server::stop() {
     // Copy all dispatchers and threads to avoid holding the lock for too long
     std::vector<std::shared_ptr<event_dispatcher>> dispatchers_to_close;
     std::vector<std::unique_ptr<std::thread>> threads_to_join;
-    
+
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        
+
         // Copy all dispatchers
         dispatchers_to_close.reserve(session_dispatchers_.size());
         for (const auto& [_, dispatcher] : session_dispatchers_) {
             dispatchers_to_close.push_back(dispatcher);
         }
-        
+
         // Copy all threads
         threads_to_join.reserve(sse_threads_.size());
         for (auto& [_, thread] : sse_threads_) {
@@ -196,20 +196,23 @@ void server::stop() {
                 threads_to_join.push_back(std::move(thread));
             }
         }
-        
+
         // Clear the maps
         session_dispatchers_.clear();
         sse_threads_.clear();
         session_initialized_.clear();
     }
-    
-    // Close all sessions
-    for (const auto& [session_id, _] : session_dispatchers_) {
-        close_session(session_id);
+
+    // Close all copied dispatchers so any threads waiting in wait_event()
+    // wake up immediately instead of blocking on the keepalive timeout.
+    for (auto& dispatcher : dispatchers_to_close) {
+        if (dispatcher) {
+            dispatcher->close();
+        }
     }
-    
+
     // Give threads some time to handle close events
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
     
     // Wait for threads to finish outside the lock (with timeout limit)
     const auto timeout_point = std::chrono::steady_clock::now() + std::chrono::seconds(2);
