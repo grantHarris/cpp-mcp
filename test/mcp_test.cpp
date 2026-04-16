@@ -373,6 +373,47 @@ TEST_F(ServerTest, ToolsList) {
     EXPECT_EQ(tools[0]["name"], "echo");
 }
 
+TEST_F(ServerTest, ToolsListNoCursorWhenAllFit) {
+    auto [sid, _] = mcp_initialize(*cli_);
+    json req = {{"jsonrpc", "2.0"}, {"id", 50}, {"method", "tools/list"},
+                {"params", json::object()}};
+    auto res = mcp_post(*cli_, "/mcp", req, sid);
+    auto result = res["_body"]["result"];
+    EXPECT_TRUE(result.contains("tools"));
+    // With only 1 tool (< page size 100), no nextCursor should be present
+    EXPECT_FALSE(result.contains("nextCursor"));
+}
+
+TEST_F(ServerTest, ToolsListWithCursor) {
+    auto [sid, _] = mcp_initialize(*cli_);
+    // Request with cursor "0" — should return same as no cursor
+    json req = {{"jsonrpc", "2.0"}, {"id", 51}, {"method", "tools/list"},
+                {"params", {{"cursor", "0"}}}};
+    auto res = mcp_post(*cli_, "/mcp", req, sid);
+    auto tools = res["_body"]["result"]["tools"];
+    EXPECT_EQ(tools.size(), 1);
+}
+
+TEST_F(ServerTest, ResourcesListNoCursor) {
+    auto [sid, _] = mcp_initialize(*cli_);
+    json req = {{"jsonrpc", "2.0"}, {"id", 52}, {"method", "resources/list"},
+                {"params", json::object()}};
+    auto res = mcp_post(*cli_, "/mcp", req, sid);
+    auto result = res["_body"]["result"];
+    EXPECT_TRUE(result.contains("resources"));
+    EXPECT_FALSE(result.contains("nextCursor"));
+}
+
+TEST_F(ServerTest, TemplatesListNoCursor) {
+    auto [sid, _] = mcp_initialize(*cli_);
+    json req = {{"jsonrpc", "2.0"}, {"id", 53}, {"method", "resources/templates/list"},
+                {"params", json::object()}};
+    auto res = mcp_post(*cli_, "/mcp", req, sid);
+    auto result = res["_body"]["result"];
+    EXPECT_TRUE(result.contains("resourceTemplates"));
+    EXPECT_FALSE(result.contains("nextCursor"));
+}
+
 TEST_F(ServerTest, ToolCall) {
     auto [sid, _] = mcp_initialize(*cli_);
     json req = {{"jsonrpc", "2.0"}, {"id", 4}, {"method", "tools/call"},
