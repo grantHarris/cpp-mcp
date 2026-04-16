@@ -48,12 +48,13 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/common)
 # Add MCP library
 add_subdirectory(src)
 
-# Add examples
-add_subdirectory(examples)
+# Only build examples and tests when built standalone (not as a subdirectory)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    add_subdirectory(examples)
 
-# Add test directory
-option(MCP_BUILD_TESTS "Build the tests" OFF)
-if(MCP_BUILD_TESTS)
-    enable_testing()
-    add_subdirectory(test)
+    option(MCP_BUILD_TESTS "Build the tests" OFF)
+    if(MCP_BUILD_TESTS)
+        enable_testing()
+        add_subdirectory(test)
+    endif()
 endif()
