@@ -421,7 +421,16 @@ void server::register_resource(const std::string& path, std::shared_ptr<resource
             return json::object();
         };
     }
-    
+
+    if (method_handlers_.find("resources/unsubscribe") == method_handlers_.end()) {
+        method_handlers_["resources/unsubscribe"] = [this](const json& params, const std::string& session_id) -> json {
+            if (!params.contains("uri")) {
+                throw mcp_exception(error_code::invalid_params, "Missing 'uri' parameter");
+            }
+            return json::object();
+        };
+    }
+
     if (method_handlers_.find("resources/templates/list") == method_handlers_.end()) {
         method_handlers_["resources/templates/list"] = [this](const json& params, const std::string& session_id) -> json {
             json templates_json = json::array();
