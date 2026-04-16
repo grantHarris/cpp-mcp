@@ -415,6 +415,19 @@ TEST_F(ServerTest, ResourceRead) {
     EXPECT_EQ(contents[0]["text"], "Hello, world!");
 }
 
+TEST_F(ServerTest, ResourceSubscribeAndUnsubscribe) {
+    auto [sid, _] = mcp_initialize(*cli_);
+    json sub = {{"jsonrpc", "2.0"}, {"id", 20}, {"method", "resources/subscribe"},
+                {"params", {{"uri", "test://hello"}}}};
+    auto res1 = mcp_post(*cli_, "/mcp", sub, sid);
+    EXPECT_EQ(res1["_status"], 200);
+
+    json unsub = {{"jsonrpc", "2.0"}, {"id", 21}, {"method", "resources/unsubscribe"},
+                  {"params", {{"uri", "test://hello"}}}};
+    auto res2 = mcp_post(*cli_, "/mcp", unsub, sid);
+    EXPECT_EQ(res2["_status"], 200);
+}
+
 TEST_F(ServerTest, ResourceTemplateRead) {
     auto [sid, _] = mcp_initialize(*cli_);
     json req = {{"jsonrpc", "2.0"}, {"id", 8}, {"method", "resources/read"},
