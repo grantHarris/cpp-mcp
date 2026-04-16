@@ -20,6 +20,7 @@
 
 #include <string>
 #include <map>
+#include <set>
 #include <vector>
 #include <memory>
 #include <mutex>
@@ -396,6 +397,25 @@ public:
     void broadcast_log(const std::string& level, const std::string& logger, const json& data);
 
     /**
+     * @brief Send a progress notification to the client that initiated a request
+     * @param session_id The session ID of the client
+     * @param progress_token The progress token from the request's _meta.progressToken
+     * @param progress Current progress value
+     * @param total Optional total value (omit if indeterminate)
+     * @param message Optional human-readable progress message
+     */
+    void send_progress(const std::string& session_id, const json& progress_token,
+                       double progress, double total = -1, const std::string& message = "");
+
+    /**
+     * @brief Check if a request has been cancelled
+     * @param request_id The JSON-RPC request ID to check
+     * @param session_id The session that sent the request
+     * @return True if the request was cancelled via notifications/cancelled
+     */
+    bool is_cancelled(const json& request_id, const std::string& session_id) const;
+
+    /**
      * @brief Set mount point for server
      * @param mount_point The mount point to set
      * @param dir The directory to serve from the mount point
@@ -530,6 +550,9 @@ private:
     auto_lock get_lock() const {
         return auto_lock(mutex_);
     }
+
+    // Cancelled request tracking (session_id -> set of request IDs)
+    std::map<std::string, std::set<std::string>> cancelled_requests_;
 
     // Session management and maintenance
     void check_inactive_sessions();

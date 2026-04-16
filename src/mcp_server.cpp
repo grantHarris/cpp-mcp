@@ -1146,7 +1146,28 @@ json server::process_request(const request& req, const std::string& session_id) 
     if (req.is_notification()) {
         if (req.method == "notifications/initialized") {
             set_session_initialized(session_id, true);
+        } else if (req.method == "notifications/cancelled") {
+            // Track cancelled request IDs
+            if (req.params.contains("requestId")) {
+                std::string rid = req.params["requestId"].dump();
+                std::lock_guard<std::mutex> lock(mutex_);
+                cancelled_requests_[session_id].insert(rid);
+            }
         }
+
+        // Dispatch to registered notification handlers
+        notification_handler handler;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = notification_handlers_.find(req.method);
+            if (it != notification_handlers_.end()) {
+                handler = it->second;
+            }
+        }
+        if (handler) {
+            handler(req.params, session_id);
+        }
+
         return json::object();
     }
     
@@ -1413,6 +1434,31 @@ std::vector<std::string> server::get_active_sessions() const {
     return sessions;
 }
 
+void server::send_progress(const std::string& session_id, const json& progress_token,
+                           double progress, double total, const std::string& message) {
+    json params = {
+        {"progressToken", progress_token},
+        {"progress", progress}
+    };
+    if (total >= 0) {
+        params["total"] = total;
+    }
+    if (!message.empty()) {
+        params["message"] = message;
+    }
+    auto notif = request::create_notification("progress");
+    notif.params = params;
+    // Fix the method — create_notification prepends "notifications/"
+    send_jsonrpc(session_id, notif.to_json());
+}
+
+bool server::is_cancelled(const json& request_id, const std::string& session_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = cancelled_requests_.find(session_id);
+    if (it == cancelled_requests_.end()) return false;
+    return it->second.count(request_id.dump()) > 0;
+}
+
 bool server::is_session_initialized(const std::string& session_id) const {
     // Check if session ID is valid
     if (session_id.empty()) {
@@ -1548,9 +1594,10 @@ void server::close_session(const std::string& session_id) {
                 sse_threads_.erase(thread_it);
             }
             
-            // Clean up initialization status and log level
+            // Clean up initialization status, log level, and cancelled requests
             session_initialized_.erase(session_id);
             session_log_levels_.erase(session_id);
+            cancelled_requests_.erase(session_id);
         }
         
         // Close dispatcher outside the lock
