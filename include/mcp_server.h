@@ -50,7 +50,7 @@ public:
         close();
     }
 
-    bool wait_event(httplib::DataSink* sink, const std::chrono::milliseconds& timeout = std::chrono::milliseconds(10000)) {
+    bool wait_event(httplib::DataSink* sink, const std::chrono::milliseconds& timeout = std::chrono::milliseconds(MCP_SSE_KEEPALIVE_MS)) {
         if (!sink || closed_.load(std::memory_order_acquire)) {
             return false;
         }
@@ -74,7 +74,18 @@ public:
             }
 
             if (!result) {
-                return false;
+                // Timeout — send an SSE keepalive comment to detect broken
+                // connections and keep intermediaries from closing the stream.
+                try {
+                    if (!sink->write(":\n\n", 3)) {
+                        close();
+                        return false;
+                    }
+                } catch (...) {
+                    close();
+                    return false;
+                }
+                return true;
             }
 
             // Only copy the message if there is one
