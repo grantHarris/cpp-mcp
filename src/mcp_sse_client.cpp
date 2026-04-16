@@ -186,30 +186,47 @@ json sse_client::call_tool(const std::string& tool_name, const json& arguments) 
 }
 
 std::vector<tool> sse_client::get_tools() {
-    json response_json = send_request("tools/list", {}).result;
     std::vector<tool> tools;
-    
-    json tools_json;
-    if (response_json.contains("tools") && response_json["tools"].is_array()) {
-        tools_json = response_json["tools"];
-    } else if (response_json.is_array()) {
-        tools_json = response_json;
-    } else {
-        return tools;
-    }
-    
-    for (const auto& tool_json : tools_json) {
-        tool t;
-        t.name = tool_json["name"];
-        t.description = tool_json["description"];
-        
-        if (tool_json.contains("inputSchema")) {
-            t.parameters_schema = tool_json["inputSchema"];
+    std::string cursor;
+
+    // Follow nextCursor pagination until exhausted
+    while (true) {
+        json params = json::object();
+        if (!cursor.empty()) {
+            params["cursor"] = cursor;
         }
-        
-        tools.push_back(t);
+        json response_json = send_request("tools/list", params).result;
+
+        json tools_json;
+        if (response_json.contains("tools") && response_json["tools"].is_array()) {
+            tools_json = response_json["tools"];
+        } else if (response_json.is_array()) {
+            tools_json = response_json;
+        } else {
+            break;
+        }
+
+        for (const auto& tool_json : tools_json) {
+            tool t;
+            t.name = tool_json["name"];
+            t.description = tool_json["description"];
+
+            if (tool_json.contains("inputSchema")) {
+                t.parameters_schema = tool_json["inputSchema"];
+            }
+
+            tools.push_back(t);
+        }
+
+        // Check for more pages
+        if (response_json.contains("nextCursor") && response_json["nextCursor"].is_string()) {
+            cursor = response_json["nextCursor"].get<std::string>();
+            if (cursor.empty()) break;
+        } else {
+            break;
+        }
     }
-    
+
     return tools;
 }
 
