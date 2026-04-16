@@ -29,8 +29,9 @@ void sse_client::init_client(const std::string& scheme_host_port, bool validate_
     http_client_->set_connection_timeout(timeout_seconds_, 0);
     http_client_->set_read_timeout(timeout_seconds_, 0);
     http_client_->set_write_timeout(timeout_seconds_, 0);
-    
+
     sse_client_->set_connection_timeout(timeout_seconds_ * 2, 0);
+    sse_client_->set_read_timeout(timeout_seconds_, 0);
     sse_client_->set_write_timeout(timeout_seconds_, 0);
 
     #ifdef MCP_SSL
@@ -140,14 +141,16 @@ void sse_client::set_header(const std::string& key, const std::string& value) {
 void sse_client::set_timeout(int timeout_seconds) {
     std::lock_guard<std::mutex> lock(mutex_);
     timeout_seconds_ = timeout_seconds;
-    
+
     if (http_client_) {
         http_client_->set_connection_timeout(timeout_seconds_, 0);
+        http_client_->set_read_timeout(timeout_seconds_, 0);
         http_client_->set_write_timeout(timeout_seconds_, 0);
     }
-    
+
     if (sse_client_) {
         sse_client_->set_connection_timeout(timeout_seconds_ * 2, 0);
+        sse_client_->set_read_timeout(timeout_seconds_, 0);
         sse_client_->set_write_timeout(timeout_seconds_, 0);
     }
 }
