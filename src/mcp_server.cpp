@@ -388,20 +388,26 @@ void server::register_resource(const std::string& path, std::shared_ptr<resource
     
     if (method_handlers_.find("resources/list") == method_handlers_.end()) {
         method_handlers_["resources/list"] = [this](const json& params, const std::string& session_id) -> json {
+            // Cursor-based pagination: cursor is the index to start from
+            size_t start = 0;
+            size_t page_size = 100;
+            if (params.contains("cursor") && params["cursor"].is_string()) {
+                try { start = std::stoul(params["cursor"].get<std::string>()); } catch (...) {}
+            }
+
             json resources = json::array();
-        
+            size_t idx = 0;
             for (const auto& [uri, res] : resources_) {
-                resources.push_back(res->get_metadata());
+                if (idx >= start && resources.size() < page_size) {
+                    resources.push_back(res->get_metadata());
+                }
+                idx++;
             }
-            
-            json result = {
-                {"resources", resources}
-            };
-            
-            if (params.contains("cursor")) {
-                result["nextCursor"] = "";
+
+            json result = {{"resources", resources}};
+            if (start + page_size < resources_.size()) {
+                result["nextCursor"] = std::to_string(start + page_size);
             }
-            
             return result;
         };
     }
@@ -424,8 +430,15 @@ void server::register_resource(const std::string& path, std::shared_ptr<resource
     
     if (method_handlers_.find("resources/templates/list") == method_handlers_.end()) {
         method_handlers_["resources/templates/list"] = [this](const json& params, const std::string& session_id) -> json {
+            size_t start = 0;
+            size_t page_size = 100;
+            if (params.contains("cursor") && params["cursor"].is_string()) {
+                try { start = std::stoul(params["cursor"].get<std::string>()); } catch (...) {}
+            }
+
             json templates_json = json::array();
-            for (const auto& tmpl : resource_templates_) {
+            for (size_t i = start; i < resource_templates_.size() && templates_json.size() < page_size; i++) {
+                const auto& tmpl = resource_templates_[i];
                 templates_json.push_back({
                     {"uriTemplate", tmpl.uri_template},
                     {"name", tmpl.name},
@@ -433,7 +446,12 @@ void server::register_resource(const std::string& path, std::shared_ptr<resource
                     {"mimeType", tmpl.mime_type}
                 });
             }
-            return json{{"resourceTemplates", templates_json}};
+
+            json result = {{"resourceTemplates", templates_json}};
+            if (start + page_size < resource_templates_.size()) {
+                result["nextCursor"] = std::to_string(start + page_size);
+            }
+            return result;
         };
     }
 }
@@ -478,9 +496,16 @@ void server::register_resource_template(
     }
 
     if (method_handlers_.find("resources/templates/list") == method_handlers_.end()) {
-        method_handlers_["resources/templates/list"] = [this](const json& /*params*/, const std::string& /*session_id*/) -> json {
+        method_handlers_["resources/templates/list"] = [this](const json& params, const std::string& /*session_id*/) -> json {
+            size_t start = 0;
+            size_t page_size = 100;
+            if (params.contains("cursor") && params["cursor"].is_string()) {
+                try { start = std::stoul(params["cursor"].get<std::string>()); } catch (...) {}
+            }
+
             json templates_json = json::array();
-            for (const auto& tmpl : resource_templates_) {
+            for (size_t i = start; i < resource_templates_.size() && templates_json.size() < page_size; i++) {
+                const auto& tmpl = resource_templates_[i];
                 templates_json.push_back({
                     {"uriTemplate", tmpl.uri_template},
                     {"name", tmpl.name},
@@ -488,7 +513,12 @@ void server::register_resource_template(
                     {"mimeType", tmpl.mime_type}
                 });
             }
-            return json{{"resourceTemplates", templates_json}};
+
+            json result = {{"resourceTemplates", templates_json}};
+            if (start + page_size < resource_templates_.size()) {
+                result["nextCursor"] = std::to_string(start + page_size);
+            }
+            return result;
         };
     }
 }
@@ -500,11 +530,26 @@ void server::register_tool(const tool& tool, tool_handler handler) {
     // Register methods for tool listing and calling
     if (method_handlers_.find("tools/list") == method_handlers_.end()) {
         method_handlers_["tools/list"] = [this](const json& params, const std::string& session_id) -> json {
-            json tools_json = json::array();
-            for (const auto& [name, tool_pair] : tools_) {
-                tools_json.push_back(tool_pair.first.to_json());
+            size_t start = 0;
+            size_t page_size = 100;
+            if (params.contains("cursor") && params["cursor"].is_string()) {
+                try { start = std::stoul(params["cursor"].get<std::string>()); } catch (...) {}
             }
-            return json{{"tools", tools_json}};
+
+            json tools_json = json::array();
+            size_t idx = 0;
+            for (const auto& [name, tool_pair] : tools_) {
+                if (idx >= start && tools_json.size() < page_size) {
+                    tools_json.push_back(tool_pair.first.to_json());
+                }
+                idx++;
+            }
+
+            json result = {{"tools", tools_json}};
+            if (start + page_size < tools_.size()) {
+                result["nextCursor"] = std::to_string(start + page_size);
+            }
+            return result;
         };
     }
     
