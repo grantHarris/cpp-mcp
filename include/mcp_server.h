@@ -40,6 +40,42 @@ using notification_handler = std::function<void(const json&, const std::string&)
 using auth_handler = std::function<bool(const std::string&, const std::string&)>;
 using session_cleanup_handler = std::function<void(const std::string&)>;
 
+/**
+ * @brief Prompt argument definition
+ */
+struct prompt_argument {
+    std::string name;
+    std::string description;
+    bool required = false;
+};
+
+/**
+ * @brief Prompt definition per MCP spec
+ */
+struct prompt {
+    std::string name;
+    std::string description;
+    std::vector<prompt_argument> arguments;
+
+    json to_json() const {
+        json j = {{"name", name}};
+        if (!description.empty()) j["description"] = description;
+        if (!arguments.empty()) {
+            json args = json::array();
+            for (const auto& arg : arguments) {
+                json a = {{"name", arg.name}};
+                if (!arg.description.empty()) a["description"] = arg.description;
+                if (arg.required) a["required"] = true;
+                args.push_back(a);
+            }
+            j["arguments"] = args;
+        }
+        return j;
+    }
+};
+
+using prompt_handler = std::function<json(const json& arguments, const std::string& session_id)>;
+
 class event_dispatcher {
 public:
     event_dispatcher() {
@@ -337,6 +373,14 @@ public:
     void register_tool(const tool& tool, tool_handler handler);
 
     /**
+     * @brief Register a prompt
+     * @param prompt The prompt definition
+     * @param handler Function called with (arguments, session_id) to produce messages
+     *                Must return JSON with a "messages" array of {role, content} objects
+     */
+    void register_prompt(const prompt& prompt, prompt_handler handler);
+
+    /**
      * @brief Register a session cleanup handler
      * @param key Tool or resource name to be cleaned up
      * @param handler The function to call when the session is closed
@@ -453,7 +497,10 @@ private:
 
     // Tools map (name -> handler)
     std::map<std::string, std::pair<tool, tool_handler>> tools_;
-    
+
+    // Prompts map (name -> {prompt, handler})
+    std::map<std::string, std::pair<prompt, prompt_handler>> prompts_;
+
     // Authentication handler
     auth_handler auth_handler_;
 

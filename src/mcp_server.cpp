@@ -605,6 +605,59 @@ void server::register_tool(const tool& tool, tool_handler handler) {
     }
 }
 
+void server::register_prompt(const prompt& prompt, prompt_handler handler) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    prompts_[prompt.name] = std::make_pair(prompt, handler);
+
+    if (method_handlers_.find("prompts/list") == method_handlers_.end()) {
+        method_handlers_["prompts/list"] = [this](const json& params, const std::string& session_id) -> json {
+            size_t start = 0;
+            size_t page_size = 100;
+            if (params.contains("cursor") && params["cursor"].is_string()) {
+                try { start = std::stoul(params["cursor"].get<std::string>()); } catch (...) {}
+            }
+
+            json prompts_json = json::array();
+            size_t idx = 0;
+            for (const auto& [name, prompt_pair] : prompts_) {
+                if (idx >= start && prompts_json.size() < page_size) {
+                    prompts_json.push_back(prompt_pair.first.to_json());
+                }
+                idx++;
+            }
+
+            json result = {{"prompts", prompts_json}};
+            if (start + page_size < prompts_.size()) {
+                result["nextCursor"] = std::to_string(start + page_size);
+            }
+            return result;
+        };
+    }
+
+    if (method_handlers_.find("prompts/get") == method_handlers_.end()) {
+        method_handlers_["prompts/get"] = [this](const json& params, const std::string& session_id) -> json {
+            if (!params.contains("name")) {
+                throw mcp_exception(error_code::invalid_params, "Missing 'name' parameter");
+            }
+
+            std::string prompt_name = params["name"];
+            auto it = prompts_.find(prompt_name);
+            if (it == prompts_.end()) {
+                throw mcp_exception(error_code::invalid_params, "Prompt not found: " + prompt_name);
+            }
+
+            json arguments = params.contains("arguments") ? params["arguments"] : json::object();
+            json result = it->second.second(arguments, session_id);
+
+            // Ensure the result contains description
+            if (!result.contains("description")) {
+                result["description"] = it->second.first.description;
+            }
+            return result;
+        };
+    }
+}
+
 void server::register_session_cleanup(const std::string& key, session_cleanup_handler handler) {
     std::lock_guard<std::mutex> lock(mutex_);
     session_cleanup_handler_[key] = handler;
