@@ -1,282 +1,286 @@
 # MCP Protocol Framework
 
-[Model Context Protocol (MCP)](https://spec.modelcontextprotocol.io/specification/2024-11-05/architecture/) is an open protocol that provides a standardized way for AI models and agents to interact with various resources, tools, and services. This framework implements the core functionality of the MCP protocol, conforming to the 2025-03-26 basic protocol specification.
+[Model Context Protocol (MCP)](https://modelcontextprotocol.io/specification/2025-03-26) is an open protocol that provides a standardized way for AI models and agents to interact with various resources, tools, and services. This framework implements the core functionality of the MCP protocol, conforming to the **2025-03-26** protocol specification.
 
 ## Core Features
 
 - **JSON-RPC 2.0 Communication**: Request/response communication based on JSON-RPC 2.0 standard
-- **Resource Abstraction**: Standard interfaces for resources such as files, APIs, etc.
-- **Tool Registration**: Register and call tools with structured parameters
-- **Extensible Architecture**: Easy to extend with new resource types and tools
-- **Multi-Transport Support**: Supports HTTP and standard input/output (stdio) communication methods
+- **Dual Transport**: Streamable HTTP (`POST/GET/DELETE /mcp`) and legacy HTTP+SSE transports
+- **Tools**: Register and call tools with JSON Schema parameter validation
+- **Resources**: Static resources, file resources, and URI template-based dynamic resources
+- **Prompts**: Server-defined prompt templates with typed arguments
+- **Logging**: Structured log delivery to clients with per-session severity filtering
+- **Progress & Cancellation**: Progress notifications for long-running operations and request cancellation
+- **Session Management**: Configurable session limits, inactive session timeout, and SSE keepalive
+- **Pagination**: Cursor-based pagination for `tools/list`, `resources/list`, and `prompts/list`
+- **SSL/TLS**: Optional OpenSSL support for HTTPS servers and clients
 
 ## How to Build
 
-Example of building with CMake:
 ```bash
 cmake -B build
-cmake --build build --config Release
+cmake --build build
 ```
 
 Build with tests:
-```
-git submodule update --init --recursive # Get GoogleTest
-
+```bash
 cmake -B build -DMCP_BUILD_TESTS=ON
-cmake --build build --config Release
+cmake --build build
+ctest --test-dir build --verbose
 ```
 
 Build with SSL support:
-```
-git submodule update --init --recursive # Get GoogleTest
-
+```bash
 cmake -B build -DMCP_SSL=ON
-cmake --build build --config Release
+cmake --build build
 ```
 
-## Adopters
+### CMake Options
 
-Here are some open-source projects that are using this repository.  
-If you're using it too, feel free to submit a PR to be featured here!
+| Option | Default | Description |
+|--------|---------|-------------|
+| `MCP_BUILD_TESTS` | `OFF` | Build the test suite (uses Google Test via FetchContent) |
+| `MCP_SSL` | `OFF` | Enable OpenSSL support for HTTPS |
+| `MCP_MAX_SESSIONS` | `10` | Maximum concurrent sessions (0 = unlimited) |
+| `MCP_SESSION_TIMEOUT` | `30` | Inactive session timeout in seconds (0 = disabled) |
+| `MCP_SSE_KEEPALIVE_MS` | `30000` | SSE keepalive probe interval in milliseconds |
 
-- [humanus.cpp](https://github.com/WHU-MYTH-Lab/humanus.cpp): Lightweight C++ LLM agent framework
-- ...waiting for your contribution...
+These can be overridden at build time (e.g. `-DMCP_MAX_SESSIONS=50`) or at runtime via the `server::configuration` struct.
 
+### Using as a Subdirectory
 
+When including cpp-mcp in a parent project via `add_subdirectory()`, examples and tests are automatically excluded. The CMake options above are available as cache variables:
+
+```cmake
+set(MCP_MAX_SESSIONS 20 CACHE STRING "" FORCE)
+add_subdirectory(external/cpp-mcp)
+target_link_libraries(my_app PRIVATE mcp)
+```
 
 ## Components
 
-The MCP C++ library includes the following main components:
+### Server (`mcp_server.h`)
 
-### Core Components
+The server supports two transports simultaneously:
 
-#### Client Interface (`mcp_client.h`)
-Defines the abstract interface for MCP clients, which all concrete client implementations inherit from.
+- **Streamable HTTP** (2025-03-26): `POST /mcp` for requests, `GET /mcp` for SSE server-push, `DELETE /mcp` for session termination. Sessions are identified by the `Mcp-Session-Id` header.
+- **Legacy HTTP+SSE** (2024-11-05): `GET /sse` opens an SSE stream that delivers an endpoint URL, then `POST /message?session_id=...` for JSON-RPC messages.
 
-#### SSE Client (`mcp_sse_client.h`, `mcp_sse_client.cpp`)
-Client implementation that communicates with MCP servers using HTTP and Server-Sent Events (SSE).
+### Client (`mcp_sse_client.h`, `mcp_stdio_client.h`)
 
-#### Stdio Client (`mcp_stdio_client.h`, `mcp_stdio_client.cpp`)
-Client implementation that communicates with MCP servers using standard input/output, capable of launching subprocesses and communicating with them.
+Two client implementations:
+- **SSE Client**: Connects to HTTP+SSE servers
+- **Stdio Client**: Launches a subprocess and communicates over stdin/stdout
 
-#### Message Processing (`mcp_message.h`, `mcp_message.cpp`)
-Handles serialization and deserialization of JSON-RPC messages.
+### Message Processing (`mcp_message.h`)
 
-#### Tool Management (`mcp_tool.h`, `mcp_tool.cpp`)
-Manages and invokes MCP tools.
+JSON-RPC 2.0 `request` and `response` structs with safe `from_json()` that handles absent fields per spec (e.g., notifications without `id`).
 
-#### Resource Management (`mcp_resource.h`, `mcp_resource.cpp`)
-Manages MCP resources.
+### Tools (`mcp_tool.h`)
 
-#### Server (`mcp_server.h`, `mcp_server.cpp`)
-Implements MCP server functionality.
-
-## Examples
-
-### HTTP Server Example (`examples/server_example.cpp`)
-
-Example MCP server implementation with custom tools:
-- Time tool: Get the current time
-- Calculator tool: Perform mathematical operations
-- Echo tool: Echo input with optional transformations (to uppercase, reverse)
-- Greeting tool: Returns `Hello, `+ input name + `!`, defaults to `Hello, World!`
-
-### HTTP Client Example (`examples/client_example.cpp`)
-
-Example MCP client connecting to a server:
-- Get server information
-- List available tools
-- Call tools with parameters
-- Access resources
-
-### Stdio Client Example (`examples/stdio_client_example.cpp`)
-
-Demonstrates how to use the stdio client to communicate with a local server:
-- Launch a local server process
-- Access filesystem resources
-- Call server tools
-
-### Agent Example (`examples/agent_example.cpp`)
-
-| Option | Description |
-| :- | :- |
-| `--base-url` | LLM base URL (e.g. `https://openrouter.ai`) |
-| `--endpoint` | LLM endpoint (default to `/v1/chat/completions/`) |
-| `--api-key` | LLM API key |
-| `--model` | Model name (e.g. `gpt-3.5-turbo`) |
-| `--system-prompt` | System prompt |
-| `--max-tokens` | Maximum number of tokens to generate (default to 2048) |
-| `--temperature` | Temperature (default to 0.0) |
-| `--max-steps` | Maximum steps calling tools without user input (default to 3) |
-
-Example usage:
-```
-./build/examples/agent_example --base-url <base_url> --endpoint <endpoint> --api-key <api_key> --model <model_name>
-```
-
-**Note**: Remember to compile with `-DMCP_SSL=ON` when connecting to an https base URL.
-
-## How to Use
-
-### Setting up an HTTP Server
+`tool_builder` fluent API for defining tools with JSON Schema parameters:
 
 ```cpp
-// Create and configure the server
-mcp::server::configuration srv_conf;
-srv_conf.host = "localhost";
-srv_conf.port = 8888;
+auto tool = mcp::tool_builder("search")
+    .with_description("Search documents")
+    .with_string_param("query", "Search query", true)
+    .with_number_param("limit", "Max results", false)
+    .build();
+```
 
-mcp::server server(srv_conf);
-server.set_server_info("MCP Example Server", "0.1.0"); // Name and version
+### Resources (`mcp_resource.h`)
 
-// Register tools
-mcp::json hello_handler(const mcp::json& params, const std::string /* session_id */) {
-    std::string name = params.contains("name") ? params["name"].get<std::string>() : "World";
+Static resources, file resources (with auto MIME detection), and URI template-based dynamic resources:
 
-    // Server will catch exceptions and return error contents
-    // For example, you can use `throw mcp::mcp_exception(mcp::error_code::invalid_params, "Invalid name");` to report an error
+```cpp
+// Static resource
+auto res = std::make_shared<mcp::text_resource>("app://status", "status", "text/plain");
+res->set_text("OK");
+server.register_resource("app://status", res);
 
-    // Content should be a JSON array, see: https://modelcontextprotocol.io/specification/2024-11-05/server/tools#tool-result
+// Dynamic resource template
+server.register_resource_template(
+    "app://items/{id}", "item", "application/json", "Item by ID",
+    [](const std::string& uri, const std::map<std::string, std::string>& params,
+       const std::string& session_id) -> mcp::json {
+        return {{"uri", uri}, {"mimeType", "application/json"},
+                {"text", get_item_json(params.at("id"))}};
+    });
+```
+
+## Server Setup
+
+```cpp
+mcp::server::configuration conf;
+conf.host = "0.0.0.0";
+conf.port = 8080;
+conf.max_sessions = 20;        // Override default
+conf.session_timeout = 60;     // 60s idle timeout
+
+mcp::server srv(conf);
+srv.set_server_info("My Server", "1.0.0");
+srv.set_capabilities({
+    {"tools", {{"listChanged", true}}},
+    {"resources", {{"subscribe", true}}},
+    {"prompts", {{"listChanged", true}}},
+    {"logging", json::object()}
+});
+```
+
+### Registering Tools
+
+```cpp
+auto echo = mcp::tool_builder("echo")
+    .with_description("Echo input back")
+    .with_string_param("text", "Text to echo")
+    .build();
+
+srv.register_tool(echo, [](const mcp::json& args, const std::string& session_id) -> mcp::json {
+    return mcp::json::array({{{"type", "text"}, {"text", args["text"]}}});
+});
+```
+
+### Registering Prompts
+
+```cpp
+mcp::prompt summarize;
+summarize.name = "summarize";
+summarize.description = "Summarize a document";
+summarize.arguments = {{"uri", "Document URI", true}, {"style", "Summary style", false}};
+
+srv.register_prompt(summarize, [](const mcp::json& args, const std::string& session_id) -> mcp::json {
     return {
-        {
-            {"type", "text"},
-            {"text", "Hello, " + name + "!"}
-        }
+        {"description", "Summarize " + args.value("uri", "")},
+        {"messages", mcp::json::array({
+            {{"role", "user"}, {"content", {{"type", "text"},
+             {"text", "Please summarize: " + args.value("uri", "")}}}}
+        })}
     };
-}
-
-mcp::tool hello_tool = mcp::tool_builder("hello")
-        .with_description("Say hello")
-        .with_string_param("name", "Name to say hello to", "World")
-        .build();
-
-server.register_tool(hello_tool, hello_handler);
-
-// Register resources
-auto file_resource = std::make_shared<mcp::file_resource>("<file_path>");
-server.register_resource("file://<file_path>", file_resource);
-
-// Start the server
-server.start(true);  // Blocking mode
+});
 ```
 
-### Creating an HTTP Client
+### Logging
+
+Clients set their desired log level via `logging/setLevel`. The server filters messages per session:
 
 ```cpp
-// Connect to the server
-mcp::sse_client client("http://localhost:8080");
+// Send a log message to a specific session
+srv.send_log(session_id, "info", "my_component", "Processing started");
 
-// Initialize the connection
+// Broadcast to all sessions that accept this level
+srv.broadcast_log("warning", "my_component", "Rate limit approaching");
+```
+
+Log levels follow syslog severity: `debug`, `info`, `notice`, `warning`, `error`, `critical`, `alert`, `emergency`.
+
+### Progress Notifications
+
+For long-running tool handlers, report progress back to the client:
+
+```cpp
+srv.register_tool(long_tool, [&srv](const mcp::json& args, const std::string& session_id) -> mcp::json {
+    auto token = args.value("_meta", mcp::json::object()).value("progressToken", mcp::json(nullptr));
+
+    for (int i = 0; i < 100; i++) {
+        if (srv.is_cancelled(request_id, session_id)) {
+            return mcp::json::array({{{"type", "text"}, {"text", "Cancelled"}}});
+        }
+        if (!token.is_null()) {
+            srv.send_progress(session_id, token, i, 100, "Step " + std::to_string(i));
+        }
+        // ... do work ...
+    }
+    return mcp::json::array({{{"type", "text"}, {"text", "Done"}}});
+});
+```
+
+### Server-to-Client Notifications
+
+```cpp
+// Send to a specific session
+auto notif = mcp::request::create_notification("resource_updated", {{"uri", "app://status"}});
+srv.send_request(session_id, notif);
+
+// Broadcast to all initialized sessions
+srv.broadcast_notification(notif);
+
+// Get connected sessions
+auto sessions = srv.get_active_sessions();
+```
+
+## Client Usage
+
+### SSE Client
+
+```cpp
+mcp::sse_client client("http://localhost:8080");
 client.initialize("My Client", "1.0.0");
 
 // Call a tool
-mcp::json params = {
-    {"name", "Client"}
-};
+mcp::json result = client.call_tool("echo", {{"text", "hello"}});
 
-mcp::json result = client.call_tool("hello", params);
+// List and read resources
+mcp::json resources = client.list_resources();
+mcp::json content = client.read_resource("app://status");
+
+// Ping
+bool alive = client.ping();
 ```
 
-### Using the SSE Client
-
-The SSE client uses HTTP and Server-Sent Events (SSE) to communicate with MCP servers. This is a communication method based on Web standards, suitable for communicating with servers that support HTTP/SSE.
+### Stdio Client
 
 ```cpp
-#include "mcp_sse_client.h"
+mcp::stdio_client client("npx -y @modelcontextprotocol/server-filesystem /path/to/dir");
+client.initialize("My Client", "1.0.0");
 
-// Create a client, specifying the server address and port
-mcp::sse_client client("http://localhost:8080");
-
-// Set an authentication token (if needed)
-client.set_auth_token("your_auth_token");
-
-// Set custom request headers (if needed)
-client.set_header("X-Custom-Header", "value");
-
-// Initialize the client
-if (!client.initialize("My Client", "1.0.0")) {
-    // Handle initialization failure
-}
-
-// Call a tool
-json result = client.call_tool("tool_name", {
-    {"param1", "value1"},
-    {"param2", 42}
-});
+mcp::json resources = client.list_resources();
+mcp::json result = client.call_tool("read_file", {{"path", "README.md"}});
 ```
 
-### Using the Stdio Client
+## TLS / HTTPS
 
-The Stdio client can communicate with any MCP server that supports stdio transport, such as:
+### Creating test certificates
 
-- @modelcontextprotocol/server-everything - Example server
-- @modelcontextprotocol/server-filesystem - Filesystem server
-- Other [MCP servers](https://www.pulsemcp.com/servers) that support stdio transport
-
-```cpp
-#include "mcp_stdio_client.h"
-
-// Create a client, specifying the server command
-mcp::stdio_client client("npx -y @modelcontextprotocol/server-everything");
-// mcp::stdio_client client("npx -y @modelcontextprotocol/server-filesystem /path/to/directory");
-
-// Initialize the client
-if (!client.initialize("My Client", "1.0.0")) {
-    // Handle initialization failure
-}
-
-// Access resources
-json resources = client.list_resources();
-json content = client.read_resource("resource://uri");
-
-// Call a tool
-json result = client.call_tool("tool_name", {
-    {"param1", "value1"},
-    {"param2", "value2"}
-});
+```bash
+openssl genrsa -out ca.key.pem 2048
+openssl req -x509 -new -nodes -key ca.key.pem -sha256 -days 365 -out ca.cert.pem -subj "/CN=Test CA"
+openssl genrsa -out server.key.pem 2048
+openssl req -new -key server.key.pem -out server.csr.pem -subj "/CN=localhost"
+openssl x509 -req -in server.csr.pem -CA ca.cert.pem -CAkey ca.key.pem -CAcreateserial -out server.cert.pem -days 365 -sha256
 ```
 
-
-## Using TLS clients and servers
-
-### Creating test certificates on Linux
-1. Generate Certificate Authority (CA) private key
-    ```bash
-    openssl genrsa -out ca.key.pem 2048
-    ```
-1. Generate CA certificate
-    ```bash
-    openssl req -x509 -new -nodes -key ca.key.pem -sha256 -days 1 -out ca.cert.pem -subj "/CN=Test CA"
-    ```
-1. Generate server private key
-    ```bash
-    openssl genrsa -out server.key.pem 2048
-    ```
-1. Generate Certificate Signing Request (CSR)
-    ```
-    openssl req -new -key server.key.pem -out server.csr.pem -subj "/O=TestServer/OU=Dev/CN=localhost"
-    ```
-1. Generate server certificate signed by CA
-    ```
-    openssl x509 -req -in server.csr.pem -CA ca.cert.pem -CAkey ca.key.pem -CAcreateserial -out server.cert.pem -days 1 -sha256
-    ```
-### Setting up an HTTPs server
+### HTTPS server
 
 ```cpp
-mcp::server::configuration srv_conf;
-srv_conf.host = "localhost";
-srv_conf.port = 8888;
-srv_conf.ssl.server_cert_path = "./server.cert.pem";
-srv_conf.ssl.server_private_key_path = "./server.key.pem";
+mcp::server::configuration conf;
+conf.host = "localhost";
+conf.port = 8443;
+conf.ssl.server_cert_path = "./server.cert.pem";
+conf.ssl.server_private_key_path = "./server.key.pem";
 ```
 
-### Setting up an SSE client with TLS
+### HTTPS client
 
 ```cpp
- mcp::sse_client client("https://localhost:8888");
- ```
+mcp::sse_client client("https://localhost:8443", "/sse", true, "./ca.cert.pem");
+```
+
+## Testing
+
+The test suite covers JSON-RPC message format, Streamable HTTP transport, tools, resources, resource templates, prompts, logging, session management, CORS, and more:
+
+```bash
+cmake -B build -DMCP_BUILD_TESTS=ON
+cmake --build build
+cd build && ctest --verbose
+```
+
+Tests run on CI via GitHub Actions on every push and PR (Ubuntu and macOS).
+
+## Adopters
+
+- [humanus.cpp](https://github.com/WHU-MYTH-Lab/humanus.cpp): Lightweight C++ LLM agent framework
 
 ## License
 
-This framework is provided under the MIT license. For details, please see the LICENSE file.
-
+MIT License. See the LICENSE file for details.
