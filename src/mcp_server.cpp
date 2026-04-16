@@ -908,6 +908,18 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
         is_initialize = true;
     }
 
+    // Spec: initialize request MUST NOT be part of a JSON-RPC batch
+    if (body.is_array()) {
+        for (const auto& item : body) {
+            if (item.is_object() && item.contains("method") && item["method"] == "initialize") {
+                res.status = 400;
+                res.set_content("{\"error\":\"Initialize request must not be batched\"}",
+                                "application/json");
+                return;
+            }
+        }
+    }
+
     // Reject re-initialization on an existing session
     if (is_initialize && !session_id.empty()) {
         std::lock_guard<std::mutex> lock(mutex_);
