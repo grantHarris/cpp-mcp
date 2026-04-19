@@ -590,6 +590,31 @@ TEST_F(ServerTest, CorsPreflightHeaders) {
     EXPECT_NE(expose.find("Mcp-Session-Id"), std::string::npos);
 }
 
+TEST_F(ServerTest, StreamableHttpGetSendsInitialBytesImmediately) {
+    auto [sid, _] = mcp_initialize(*cli_);
+    ASSERT_FALSE(sid.empty());
+
+    std::atomic<bool> got_data{false};
+    auto sse_cli = std::make_unique<httplib::Client>("127.0.0.1", port_);
+    sse_cli->set_read_timeout(2);
+
+    httplib::Headers headers;
+    headers.emplace("Accept", "text/event-stream");
+    headers.emplace("Mcp-Session-Id", sid);
+
+    std::thread t([&] {
+        sse_cli->Get("/mcp", headers, [&](const char* data, size_t len) {
+            if (len > 0) {
+                got_data.store(true);
+            }
+            return false; // close after the initial SSE bytes
+        });
+    });
+    t.join();
+
+    EXPECT_TRUE(got_data.load());
+}
+
 // ===========================================================================
 // Legacy SSE Transport
 // ===========================================================================
