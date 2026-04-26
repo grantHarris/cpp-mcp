@@ -35,6 +35,12 @@
 
 namespace mcp {
 
+// Page size for cursor-paginated list endpoints (tools/list, resources/list,
+// resources/templates/list, prompts/list). Clients that don't follow
+// nextCursor see only the first page, so the cap doubles as the practical
+// per-server limit on visible items.
+constexpr size_t kListPageSize = 250;
+
 using method_handler = std::function<json(const json&, const std::string&)>;
 using tool_handler = method_handler;
 using notification_handler = std::function<void(const json&, const std::string&)>;

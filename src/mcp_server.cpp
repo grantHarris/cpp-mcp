@@ -346,7 +346,7 @@ void server::register_resource(const std::string& path, std::shared_ptr<resource
         method_handlers_["resources/list"] = [this](const json& params, const std::string& session_id) -> json {
             // Cursor-based pagination: cursor is the index to start from
             size_t start = 0;
-            size_t page_size = 100;
+            size_t page_size = kListPageSize;
             if (params.contains("cursor") && params["cursor"].is_string()) {
                 try { start = std::stoul(params["cursor"].get<std::string>()); } catch (...) {}
             }
@@ -396,7 +396,7 @@ void server::register_resource(const std::string& path, std::shared_ptr<resource
     if (method_handlers_.find("resources/templates/list") == method_handlers_.end()) {
         method_handlers_["resources/templates/list"] = [this](const json& params, const std::string& session_id) -> json {
             size_t start = 0;
-            size_t page_size = 100;
+            size_t page_size = kListPageSize;
             if (params.contains("cursor") && params["cursor"].is_string()) {
                 try { start = std::stoul(params["cursor"].get<std::string>()); } catch (...) {}
             }
@@ -463,7 +463,7 @@ void server::register_resource_template(
     if (method_handlers_.find("resources/templates/list") == method_handlers_.end()) {
         method_handlers_["resources/templates/list"] = [this](const json& params, const std::string& /*session_id*/) -> json {
             size_t start = 0;
-            size_t page_size = 100;
+            size_t page_size = kListPageSize;
             if (params.contains("cursor") && params["cursor"].is_string()) {
                 try { start = std::stoul(params["cursor"].get<std::string>()); } catch (...) {}
             }
@@ -496,7 +496,7 @@ void server::register_tool(const tool& tool, tool_handler handler) {
     if (method_handlers_.find("tools/list") == method_handlers_.end()) {
         method_handlers_["tools/list"] = [this](const json& params, const std::string& session_id) -> json {
             size_t start = 0;
-            size_t page_size = 100;
+            size_t page_size = kListPageSize;
             if (params.contains("cursor") && params["cursor"].is_string()) {
                 try { start = std::stoul(params["cursor"].get<std::string>()); } catch (...) {}
             }
@@ -568,7 +568,7 @@ void server::register_prompt(const prompt& prompt, prompt_handler handler) {
     if (method_handlers_.find("prompts/list") == method_handlers_.end()) {
         method_handlers_["prompts/list"] = [this](const json& params, const std::string& session_id) -> json {
             size_t start = 0;
-            size_t page_size = 100;
+            size_t page_size = kListPageSize;
             if (params.contains("cursor") && params["cursor"].is_string()) {
                 try { start = std::stoul(params["cursor"].get<std::string>()); } catch (...) {}
             }
