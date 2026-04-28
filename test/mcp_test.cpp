@@ -766,3 +766,144 @@ TEST_F(ServerTest, BroadcastNotification) {
     auto notif = request::create_notification("test_event", {{"data", "hello"}});
     EXPECT_NO_THROW(srv_->broadcast_notification(notif));
 }
+
+// ===========================================================================
+// event_dispatcher: queued events are delivered in order
+// ===========================================================================
+//
+// Regression for the lost-event race fixed by the queue-based dispatcher.
+// The pre-fix dispatcher had a single std::string slot plus an id_/cid_
+// equality predicate: two send_event() calls between consume cycles would
+// (a) overwrite the first message in the slot, and (b) skip cid_ past the
+// consumer's snapshot, stranding wait_event() until keepalive timeout.
+// Practical impact: large/slow tool responses (e.g. 80KB add_stage payload)
+// raced with the 5-second heartbeat thread and never reached the client —
+// the SSE channel just kept emitting heartbeats forever.
+
+TEST(EventDispatcher, DeliversAllQueuedEventsInOrder) {
+    event_dispatcher dispatcher;
+
+    // Enqueue three events before any consumer runs. Pre-fix this would
+    // leave only the third in the slot and strand wait_event waiting for
+    // a stale id snapshot.
+    EXPECT_TRUE(dispatcher.send_event("event-1"));
+    EXPECT_TRUE(dispatcher.send_event("event-2"));
+    EXPECT_TRUE(dispatcher.send_event("event-3"));
+
+    std::string out;
+    httplib::DataSink sink;
+    sink.write = [&out](const char* data, size_t len) {
+        out.append(data, len);
+        return true;
+    };
+    sink.is_writable = [] { return true; };
+    sink.done = [] {};
+    sink.done_with_trailer = [](const httplib::Headers&) {};
+
+    EXPECT_TRUE(dispatcher.wait_event(&sink, std::chrono::milliseconds(50)));
+    EXPECT_EQ(out, "event-1");
+    out.clear();
+
+    EXPECT_TRUE(dispatcher.wait_event(&sink, std::chrono::milliseconds(50)));
+    EXPECT_EQ(out, "event-2");
+    out.clear();
+
+    EXPECT_TRUE(dispatcher.wait_event(&sink, std::chrono::milliseconds(50)));
+    EXPECT_EQ(out, "event-3");
+}
+
+TEST(EventDispatcher, ConcurrentSendersDoNotLoseEvents) {
+    // Reproduces the heartbeat-vs-tool-response race. Two threads emit
+    // distinct messages while a single consumer drains them. Pre-fix the
+    // strict cid_ == id predicate stranded the consumer when the second
+    // sender ran between the consumer's wakeup and lock acquisition;
+    // here we expect EVERY message from both senders to reach the sink.
+    event_dispatcher dispatcher;
+
+    constexpr int N = 50;
+    std::atomic<int> heartbeats_sent{0};
+    std::atomic<int> responses_sent{0};
+
+    std::thread hb([&] {
+        for (int i = 0; i < N; ++i) {
+            if (dispatcher.send_event("hb-" + std::to_string(i))) {
+                ++heartbeats_sent;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+    });
+    std::thread resp([&] {
+        for (int i = 0; i < N; ++i) {
+            if (dispatcher.send_event("resp-" + std::to_string(i))) {
+                ++responses_sent;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(150));
+        }
+    });
+
+    hb.join();
+    resp.join();
+
+    std::string out;
+    httplib::DataSink sink;
+    sink.write = [&out](const char* data, size_t len) {
+        out.append(data, len);
+        return true;
+    };
+    sink.is_writable = [] { return true; };
+    sink.done = [] {};
+    sink.done_with_trailer = [](const httplib::Headers&) {};
+
+    int consumed = 0;
+    while (consumed < heartbeats_sent + responses_sent) {
+        std::string before = out;
+        if (!dispatcher.wait_event(&sink, std::chrono::milliseconds(50))) {
+            break;
+        }
+        if (out.size() > before.size()) {
+            ++consumed;
+        }
+    }
+
+    EXPECT_EQ(heartbeats_sent.load(), N);
+    EXPECT_EQ(responses_sent.load(), N);
+    EXPECT_EQ(consumed, 2 * N);
+
+    // Every message body must appear exactly once in the sink output.
+    for (int i = 0; i < N; ++i) {
+        EXPECT_NE(out.find("hb-" + std::to_string(i)), std::string::npos)
+            << "lost hb-" << i;
+        EXPECT_NE(out.find("resp-" + std::to_string(i)), std::string::npos)
+            << "lost resp-" << i;
+    }
+}
+
+TEST(EventDispatcher, OverflowReturnsFalseRatherThanBlocking) {
+    // The bounded queue caps memory growth if a consumer stalls. Past the
+    // cap, send_event returns false so the caller can detect a wedged
+    // connection rather than silently dropping or growing unbounded.
+    event_dispatcher dispatcher;
+
+    size_t sent = 0;
+    while (dispatcher.send_event("x") && sent < event_dispatcher::MAX_QUEUED_EVENTS + 10) {
+        ++sent;
+    }
+    EXPECT_EQ(sent, event_dispatcher::MAX_QUEUED_EVENTS);
+
+    // After overflow, further sends still fail until the consumer drains.
+    EXPECT_FALSE(dispatcher.send_event("y"));
+
+    std::string out;
+    httplib::DataSink sink;
+    sink.write = [&out](const char* data, size_t len) {
+        out.append(data, len);
+        return true;
+    };
+    sink.is_writable = [] { return true; };
+    sink.done = [] {};
+    sink.done_with_trailer = [](const httplib::Headers&) {};
+    EXPECT_TRUE(dispatcher.wait_event(&sink, std::chrono::milliseconds(50)));
+
+    // One slot freed — next send succeeds.
+    EXPECT_TRUE(dispatcher.send_event("y"));
+}
