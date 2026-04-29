@@ -171,6 +171,15 @@ TEST(MessageFormat, ResponseFromJsonNoResult) {
 // Tool Builder Tests
 // ===========================================================================
 
+TEST(ProtocolVersion, ConstantsExposed) {
+    EXPECT_STREQ(mcp::LATEST_MCP_VERSION, "2025-11-25");
+    EXPECT_TRUE(mcp::is_supported_version("2025-11-25"));
+    EXPECT_TRUE(mcp::is_supported_version("2025-06-18"));
+    EXPECT_TRUE(mcp::is_supported_version("2025-03-26"));
+    EXPECT_FALSE(mcp::is_supported_version("2024-11-05"));
+    EXPECT_FALSE(mcp::is_supported_version(""));
+}
+
 TEST(ToolBuilder, BasicTool) {
     auto t = tool_builder("echo")
         .with_description("Echoes input back")
@@ -289,7 +298,7 @@ TEST_F(ServerTest, InitializeReturnsSessionId) {
     EXPECT_EQ(body["result"]["serverInfo"]["name"], "TestServer");
 }
 
-TEST_F(ServerTest, InitializeVersionNegotiation) {
+TEST_F(ServerTest, InitializeUnsupportedVersionFallsBackToLatest) {
     json req = {
         {"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"},
         {"params", {
@@ -299,8 +308,37 @@ TEST_F(ServerTest, InitializeVersionNegotiation) {
         }}
     };
     auto res = mcp_post(*cli_, "/mcp", req);
-    // Server responds with its own version regardless
-    EXPECT_EQ(res["_body"]["result"]["protocolVersion"], MCP_VERSION);
+    // Unknown version → server falls back to its latest supported.
+    EXPECT_EQ(res["_body"]["result"]["protocolVersion"], LATEST_MCP_VERSION);
+}
+
+TEST_F(ServerTest, InitializeNegotiatesClientRequestedVersion) {
+    // 2025-06-18 is in our supported set; server should echo it back.
+    json req = {
+        {"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"},
+        {"params", {
+            {"protocolVersion", "2025-06-18"},
+            {"clientInfo", {{"name", "Mid"}, {"version", "1.0"}}},
+            {"capabilities", json::object()}
+        }}
+    };
+    auto res = mcp_post(*cli_, "/mcp", req);
+    EXPECT_EQ(res["_body"]["result"]["protocolVersion"], "2025-06-18");
+}
+
+TEST_F(ServerTest, InitializeStoresNegotiatedVersionPerSession) {
+    json req = {
+        {"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"},
+        {"params", {
+            {"protocolVersion", "2025-03-26"},
+            {"clientInfo", {{"name", "Old"}, {"version", "1.0"}}},
+            {"capabilities", json::object()}
+        }}
+    };
+    auto res = mcp_post(*cli_, "/mcp", req);
+    std::string sid = res.value("_session_id", "");
+    ASSERT_FALSE(sid.empty());
+    EXPECT_EQ(srv_->session_protocol_version(sid), "2025-03-26");
 }
 
 TEST_F(ServerTest, PingAfterInitialize) {
@@ -362,19 +400,153 @@ TEST_F(ServerTest, NotificationReturns202) {
     EXPECT_EQ(res["_status"], 202);
 }
 
-TEST_F(ServerTest, BatchRequest) {
+// MCP-Protocol-Version header (spec 2025-06-18). Server must emit it on
+// every response and validate it on post-init Streamable HTTP requests.
+TEST_F(ServerTest, InitializeResponseSendsProtocolVersionHeader) {
+    json init_req = {
+        {"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"},
+        {"params", {
+            {"protocolVersion", "2025-11-25"},
+            {"clientInfo", {{"name", "T"}, {"version", "1"}}},
+            {"capabilities", json::object()}
+        }}
+    };
+    httplib::Headers h = {
+        {"Content-Type", "application/json"},
+        {"Accept", "application/json, text/event-stream"}
+    };
+    auto res = cli_->Post("/mcp", h, init_req.dump(), "application/json");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 200);
+    EXPECT_EQ(res->get_header_value("MCP-Protocol-Version"), "2025-11-25");
+}
+
+TEST_F(ServerTest, RejectsMismatchedProtocolVersionHeader) {
+    auto [sid, _] = mcp_initialize(*cli_);  // negotiates LATEST_MCP_VERSION
+    httplib::Headers h = {
+        {"Content-Type", "application/json"},
+        {"Accept", "application/json, text/event-stream"},
+        {"Mcp-Session-Id", sid},
+        {"MCP-Protocol-Version", "2025-03-26"}  // mismatch
+    };
+    json ping = {{"jsonrpc", "2.0"}, {"id", 99}, {"method", "ping"}};
+    auto res = cli_->Post("/mcp", h, ping.dump(), "application/json");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 400);
+}
+
+TEST_F(ServerTest, RejectsUnknownProtocolVersionHeader) {
+    auto [sid, _] = mcp_initialize(*cli_);
+    httplib::Headers h = {
+        {"Content-Type", "application/json"},
+        {"Accept", "application/json, text/event-stream"},
+        {"Mcp-Session-Id", sid},
+        {"MCP-Protocol-Version", "1999-01-01"}
+    };
+    json ping = {{"jsonrpc", "2.0"}, {"id", 99}, {"method", "ping"}};
+    auto res = cli_->Post("/mcp", h, ping.dump(), "application/json");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 400);
+}
+
+TEST_F(ServerTest, AcceptsMissingProtocolVersionHeader) {
+    // Spec compat: missing header implies 2025-03-26. We allow it through.
+    auto [sid, _] = mcp_initialize(*cli_);
+    json ping = {{"jsonrpc", "2.0"}, {"id", 99}, {"method", "ping"}};
+    auto res = mcp_post(*cli_, "/mcp", ping, sid);  // helper omits the header
+    EXPECT_EQ(res["_status"], 200);
+}
+
+// Origin allowlist with HTTP 403 (spec 2025-11-25).
+namespace {
+struct OriginServer {
+    std::unique_ptr<server> srv;
+    std::unique_ptr<httplib::Client> cli;
+    int port;
+
+    explicit OriginServer(std::vector<std::string> allowlist) {
+        port = next_port();
+        server::configuration conf;
+        conf.host = "127.0.0.1";
+        conf.port = port;
+        conf.allowed_origins = std::move(allowlist);
+        srv = std::make_unique<server>(conf);
+        srv->start(false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        cli = std::make_unique<httplib::Client>("127.0.0.1", port);
+        cli->set_connection_timeout(2);
+        cli->set_read_timeout(5);
+    }
+    ~OriginServer() {
+        cli.reset();
+        if (srv) srv->stop();
+    }
+};
+
+httplib::Result post_init_with_origin(httplib::Client& c, const std::string& origin) {
+    json init = {{"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"},
+                 {"params", {{"protocolVersion", LATEST_MCP_VERSION},
+                             {"clientInfo", {{"name", "t"}, {"version", "0"}}},
+                             {"capabilities", json::object()}}}};
+    httplib::Headers h = {
+        {"Content-Type", "application/json"},
+        {"Accept", "application/json, text/event-stream"},
+        {"Origin", origin}
+    };
+    return c.Post("/mcp", h, init.dump(), "application/json");
+}
+}  // namespace
+
+TEST(OriginAllowlist, RejectsDisallowedOrigin) {
+    OriginServer s({"http://localhost:3000"});
+    auto resp = post_init_with_origin(*s.cli, "http://evil.example.com");
+    ASSERT_TRUE(resp);
+    EXPECT_EQ(resp->status, 403);
+}
+
+TEST(OriginAllowlist, AllowsListedOrigin) {
+    OriginServer s({"http://localhost:3000"});
+    auto resp = post_init_with_origin(*s.cli, "http://localhost:3000");
+    ASSERT_TRUE(resp);
+    EXPECT_EQ(resp->status, 200);
+}
+
+TEST(OriginAllowlist, EmptyAllowlistAllowsAllOrigins) {
+    OriginServer s({});
+    auto resp = post_init_with_origin(*s.cli, "http://anywhere.example.com");
+    ASSERT_TRUE(resp);
+    EXPECT_EQ(resp->status, 200);
+}
+
+TEST(OriginAllowlist, MissingOriginIsAllowed) {
+    OriginServer s({"http://localhost:3000"});
+    json init = {{"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"},
+                 {"params", {{"protocolVersion", LATEST_MCP_VERSION},
+                             {"clientInfo", {{"name", "t"}, {"version", "0"}}},
+                             {"capabilities", json::object()}}}};
+    httplib::Headers h = {
+        {"Content-Type", "application/json"},
+        {"Accept", "application/json, text/event-stream"}
+    };
+    auto resp = s.cli->Post("/mcp", h, init.dump(), "application/json");
+    ASSERT_TRUE(resp);
+    EXPECT_EQ(resp->status, 200);
+}
+
+// Spec 2025-06-18 removed JSON-RPC batching. Servers MUST reject array bodies.
+TEST_F(ServerTest, BatchRejected) {
     auto [sid, _] = mcp_initialize(*cli_);
     json batch = json::array({
         {{"jsonrpc", "2.0"}, {"id", 10}, {"method", "ping"}},
         {{"jsonrpc", "2.0"}, {"id", 11}, {"method", "ping"}}
     });
     auto res = mcp_post(*cli_, "/mcp", batch, sid);
-    // Should get back an array of two responses or SSE
-    int status = res["_status"];
-    EXPECT_TRUE(status == 200);
+    EXPECT_EQ(res["_status"], 400);
+    EXPECT_EQ(res["_body"]["error"]["code"].get<int>(),
+              static_cast<int>(error_code::invalid_request));
 }
 
-TEST_F(ServerTest, RejectInitializeInBatch) {
+TEST_F(ServerTest, BatchedInitializeRejected) {
     json batch = json::array({
         {{"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"},
          {"params", {{"protocolVersion", MCP_VERSION},
@@ -451,12 +623,40 @@ TEST_F(ServerTest, ToolCall) {
     EXPECT_EQ(content[0]["text"], "hello");
 }
 
-TEST_F(ServerTest, ToolCallNotFound) {
+// Spec 2025-11-25 (SEP-1303): tools/call validation errors are returned as
+// CallToolResult with isError:true, not as JSON-RPC -32602 protocol errors,
+// so the model can self-correct on the next attempt.
+
+TEST_F(ServerTest, ToolCallUnknownReturnsToolError) {
     auto [sid, _] = mcp_initialize(*cli_);
     json req = {{"jsonrpc", "2.0"}, {"id", 5}, {"method", "tools/call"},
                 {"params", {{"name", "nonexistent"}}}};
     auto res = mcp_post(*cli_, "/mcp", req, sid);
-    EXPECT_TRUE(res["_body"].contains("error"));
+    ASSERT_EQ(res["_status"], 200);
+    ASSERT_TRUE(res["_body"].contains("result"));
+    EXPECT_FALSE(res["_body"].contains("error"));
+    EXPECT_EQ(res["_body"]["result"]["isError"], true);
+    EXPECT_EQ(res["_body"]["result"]["content"][0]["type"], "text");
+}
+
+TEST_F(ServerTest, ToolCallMissingNameReturnsToolError) {
+    auto [sid, _] = mcp_initialize(*cli_);
+    json req = {{"jsonrpc", "2.0"}, {"id", 5}, {"method", "tools/call"},
+                {"params", json::object()}};
+    auto res = mcp_post(*cli_, "/mcp", req, sid);
+    ASSERT_EQ(res["_status"], 200);
+    ASSERT_TRUE(res["_body"].contains("result"));
+    EXPECT_EQ(res["_body"]["result"]["isError"], true);
+}
+
+TEST_F(ServerTest, ToolCallBadJsonStringArgsReturnsToolError) {
+    auto [sid, _] = mcp_initialize(*cli_);
+    json req = {{"jsonrpc", "2.0"}, {"id", 5}, {"method", "tools/call"},
+                {"params", {{"name", "echo"}, {"arguments", "{not valid json"}}}};
+    auto res = mcp_post(*cli_, "/mcp", req, sid);
+    ASSERT_EQ(res["_status"], 200);
+    ASSERT_TRUE(res["_body"].contains("result"));
+    EXPECT_EQ(res["_body"]["result"]["isError"], true);
 }
 
 // ===========================================================================

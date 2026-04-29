@@ -9,6 +9,7 @@
 #ifndef MCP_MESSAGE_H
 #define MCP_MESSAGE_H
 
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <map>
@@ -24,8 +25,28 @@ namespace mcp {
 // Use the nlohmann json library
 using json = nlohmann::ordered_json;
 
-// MCP version
-constexpr const char* MCP_VERSION = "2025-03-26";
+// Latest MCP protocol version this implementation supports.
+constexpr const char* LATEST_MCP_VERSION = "2025-11-25";
+
+// All MCP protocol versions accepted during initialize negotiation,
+// newest-first. Order is significant for negotiation logging only.
+inline const std::vector<std::string>& supported_mcp_versions() {
+    static const std::vector<std::string> versions = {
+        "2025-11-25",
+        "2025-06-18",
+        "2025-03-26",
+    };
+    return versions;
+}
+
+inline bool is_supported_version(const std::string& version) {
+    if (version.empty()) return false;
+    const auto& v = supported_mcp_versions();
+    return std::find(v.begin(), v.end(), version) != v.end();
+}
+
+// Backward-compat alias. Prefer LATEST_MCP_VERSION in new code.
+constexpr const char* MCP_VERSION = LATEST_MCP_VERSION;
 
 // MCP error codes (JSON-RPC 2.0 standard codes)
 enum class error_code {

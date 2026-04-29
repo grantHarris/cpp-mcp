@@ -30,6 +30,7 @@ server::server(const server::configuration& conf)
     , thread_pool_(conf.threadpool_size)
     , max_sessions_(conf.max_sessions)
     , session_timeout_(conf.session_timeout)
+    , allowed_origins_(conf.allowed_origins)
 {
     #ifdef MCP_SSL
     if (conf.ssl.server_cert_path && conf.ssl.server_private_key_path) {
@@ -520,42 +521,47 @@ void server::register_tool(const tool& tool, tool_handler handler) {
     
     if (method_handlers_.find("tools/call") == method_handlers_.end()) {
         method_handlers_["tools/call"] = [this](const json& params, const std::string& session_id) -> json {
-            if (!params.contains("name")) {
-                throw mcp_exception(error_code::invalid_params, "Missing 'name' parameter");
+            // Spec 2025-11-25 (SEP-1303): tool input-validation failures are
+            // returned as CallToolResult{ isError: true, ... }, not as
+            // JSON-RPC -32602 protocol errors, so the model can self-correct.
+            auto tool_error = [](const std::string& msg) {
+                return json{
+                    {"isError", true},
+                    {"content", json::array({
+                        {{"type", "text"}, {"text", msg}}
+                    })}
+                };
+            };
+
+            if (!params.contains("name") || !params["name"].is_string()) {
+                return tool_error("Missing or invalid 'name' parameter");
             }
-            
+
             std::string tool_name = params["name"];
             auto it = tools_.find(tool_name);
             if (it == tools_.end()) {
-                throw mcp_exception(error_code::invalid_params, "Tool not found: " + tool_name);
+                return tool_error("Tool not found: " + tool_name);
             }
-            
-            json tool_args = params.contains("arguments") ? params["arguments"] : json::array();
+
+            json tool_args = params.contains("arguments") ? params["arguments"] : json::object();
 
             if (tool_args.is_string()) {
                 try {
                     tool_args = json::parse(tool_args.get<std::string>());
                 } catch (const json::exception& e) {
-                    throw mcp_exception(error_code::invalid_params, "Invalid JSON arguments: " + std::string(e.what()));
+                    return tool_error("Invalid JSON arguments: " + std::string(e.what()));
                 }
             }
 
-            json tool_result = {
-                {"isError", false}
-            };
-
+            json tool_result = {{"isError", false}};
             try {
                 tool_result["content"] = it->second.second(tool_args, session_id);
             } catch (const std::exception& e) {
                 tool_result["isError"] = true;
                 tool_result["content"] = json::array({
-                    {
-                        {"type", "text"},
-                        {"text", e.what()}
-                    }
+                    {{"type", "text"}, {"text", e.what()}}
                 });
             }
-
             return tool_result;
         };
     }
@@ -636,6 +642,11 @@ void server::set_auth_handler(auth_handler handler) {
 }
 
 void server::handle_sse(const httplib::Request& req, httplib::Response& res) {
+    if (!origin_is_allowed(req)) {
+        res.status = 403;
+        res.set_content("{\"error\":\"Forbidden origin\"}", "application/json");
+        return;
+    }
     // Enforce session limit
     if (max_sessions_ > 0) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -764,12 +775,17 @@ void server::handle_sse(const httplib::Request& req, httplib::Response& res) {
 }
 
 void server::handle_jsonrpc(const httplib::Request& req, httplib::Response& res) {
+    if (!origin_is_allowed(req)) {
+        res.status = 403;
+        res.set_content("{\"error\":\"Forbidden origin\"}", "application/json");
+        return;
+    }
     // Setup response headers
     res.set_header("Content-Type", "application/json");
     res.set_header("Access-Control-Allow-Origin", "*");
     res.set_header("Access-Control-Allow-Methods", "POST, OPTIONS");
     res.set_header("Access-Control-Allow-Headers", "Content-Type");
-    
+
     // Handle OPTIONS request (CORS pre-flight)
     if (req.method == "OPTIONS") {
         res.status = 204; // No Content
@@ -882,6 +898,38 @@ void server::handle_jsonrpc(const httplib::Request& req, httplib::Response& res)
 // Streamable HTTP transport (2025-03-26 spec)
 // ---------------------------------------------------------------------------
 
+bool server::origin_is_allowed(const httplib::Request& req) const {
+    if (allowed_origins_.empty()) {
+        return true;  // unset = no check
+    }
+    std::string origin = req.get_header_value("Origin");
+    if (origin.empty()) {
+        return true;  // browsers omit for same-origin / non-browser clients
+    }
+    return std::find(allowed_origins_.begin(), allowed_origins_.end(), origin)
+           != allowed_origins_.end();
+}
+
+std::pair<int, std::string>
+server::validate_protocol_version_header(const httplib::Request& req,
+                                         const std::string& session_id) const {
+    std::string header = req.get_header_value("MCP-Protocol-Version");
+    if (header.empty()) {
+        // Spec compat: missing header implies 2025-03-26.
+        return {200, ""};
+    }
+    if (!is_supported_version(header)) {
+        return {400, "Unsupported MCP-Protocol-Version: " + header};
+    }
+    std::string negotiated = session_protocol_version(session_id);
+    if (!negotiated.empty() && header != negotiated) {
+        return {400,
+            "MCP-Protocol-Version header (" + header +
+            ") does not match negotiated session version (" + negotiated + ")"};
+    }
+    return {200, ""};
+}
+
 request server::parse_jsonrpc_message(const json& j) const {
     request req;
     req.jsonrpc = j.value("jsonrpc", "2.0");
@@ -898,11 +946,25 @@ request server::parse_jsonrpc_message(const json& j) const {
 }
 
 void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res) {
+    if (!origin_is_allowed(req)) {
+        res.status = 403;
+        res.set_content("{\"error\":\"Forbidden origin\"}", "application/json");
+        return;
+    }
     // CORS headers
     res.set_header("Access-Control-Allow-Origin", "*");
     res.set_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-    res.set_header("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id");
-    res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id");
+    res.set_header("Access-Control-Allow-Headers",
+                   "Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version");
+    res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id, MCP-Protocol-Version");
+
+    // Reflect the protocol version of this exchange on every response.
+    {
+        std::string sid = req.get_header_value("Mcp-Session-Id");
+        std::string ver = !sid.empty() ? session_protocol_version(sid) : "";
+        if (ver.empty()) ver = LATEST_MCP_VERSION;
+        res.set_header("MCP-Protocol-Version", ver);
+    }
 
     // Parse JSON body
     json body;
@@ -926,16 +988,15 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
         is_initialize = true;
     }
 
-    // Spec: initialize request MUST NOT be part of a JSON-RPC batch
+    // Spec 2025-06-18 removed JSON-RPC batching; reject array bodies outright.
     if (body.is_array()) {
-        for (const auto& item : body) {
-            if (item.is_object() && item.contains("method") && item["method"] == "initialize") {
-                res.status = 400;
-                res.set_content("{\"error\":\"Initialize request must not be batched\"}",
-                                "application/json");
-                return;
-            }
-        }
+        res.status = 400;
+        res.set_content(
+            response::create_error(nullptr, error_code::invalid_request,
+                                   "JSON-RPC batching is not supported (spec 2025-06-18+)")
+                .to_json().dump(),
+            "application/json");
+        return;
     }
 
     // Reject re-initialization on an existing session
@@ -956,42 +1017,32 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
             res.set_content("{\"error\":\"Missing Mcp-Session-Id header\"}", "application/json");
             return;
         }
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (session_dispatchers_.find(session_id) == session_dispatchers_.end()) {
-            // Session expired or invalid — client must re-initialize
-            res.status = 404;
-            res.set_content("{\"error\":\"Session not found\"}", "application/json");
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (session_dispatchers_.find(session_id) == session_dispatchers_.end()) {
+                // Session expired or invalid — client must re-initialize
+                res.status = 404;
+                res.set_content("{\"error\":\"Session not found\"}", "application/json");
+                return;
+            }
+        }
+        auto [vstatus, vmsg] = validate_protocol_version_header(req, session_id);
+        if (vstatus != 200) {
+            res.status = vstatus;
+            res.set_content(
+                response::create_error(nullptr, error_code::invalid_request, vmsg)
+                    .to_json().dump(),
+                "application/json");
             return;
         }
     }
 
-    // Handle batched requests
-    std::vector<json> items;
-    if (body.is_array()) {
-        for (const auto& item : body) {
-            items.push_back(item);
-        }
-    } else {
-        items.push_back(body);
-    }
-
-    // Categorize: are there any requests (with id), or only notifications/responses?
-    bool has_requests = false;
-    bool all_notifications_or_responses = true;
-    for (const auto& item : items) {
-        if (item.contains("method") && item.contains("id") && !item["id"].is_null()) {
-            has_requests = true;
-            all_notifications_or_responses = false;
-        }
-    }
-
-    // If all notifications/responses, process and return 202
-    if (all_notifications_or_responses && !has_requests) {
-        for (const auto& item : items) {
-            auto mcp_req = parse_jsonrpc_message(item);
-            if (!session_id.empty()) {
-                process_request(mcp_req, session_id);
-            }
+    // Notifications and responses (no id, or id=null): fire and forget.
+    bool has_request_id = body.contains("id") && !body["id"].is_null();
+    if (!has_request_id) {
+        if (!session_id.empty()) {
+            auto mcp_req = parse_jsonrpc_message(body);
+            process_request(mcp_req, session_id);
         }
         res.status = 202;
         return;
@@ -1020,73 +1071,46 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
             session_dispatchers_[session_id] = session_dispatcher;
         }
 
-        auto mcp_req = parse_jsonrpc_message(items[0]);
+        auto mcp_req = parse_jsonrpc_message(body);
         json result = handle_initialize(mcp_req, session_id);
 
         res.set_header("Mcp-Session-Id", session_id);
+        // Override the placeholder set at the top of the handler now that we
+        // know what version was negotiated.
+        std::string negotiated = session_protocol_version(session_id);
+        if (!negotiated.empty()) {
+            res.set_header("MCP-Protocol-Version", negotiated);
+        }
         res.set_header("Content-Type", "application/json");
         res.set_content(result.dump(), "application/json");
         return;
     }
 
-    // Non-initialize requests: check Accept header to decide response mode
-    std::string accept = req.get_header_value("Accept");
-    bool client_accepts_sse = accept.find("text/event-stream") != std::string::npos;
-
-    // Process all items, collect responses for requests
-    json responses = json::array();
-    for (const auto& item : items) {
-        auto mcp_req = parse_jsonrpc_message(item);
-
-        if (mcp_req.is_notification()) {
-            // Fire-and-forget
-            process_request(mcp_req, session_id);
-            continue;
-        }
-
-        // Process request synchronously (inline response)
-        json result = process_request(mcp_req, session_id);
-        responses.push_back(result);
-    }
-
-    if (responses.empty()) {
-        res.status = 202;
-        return;
-    }
-
-    // If client accepts SSE and we might want to stream, use SSE
-    // For now, use inline JSON for simplicity — SSE streaming on POST
-    // can be added later for long-running operations
-    if (client_accepts_sse && responses.size() > 1) {
-        // Stream responses as SSE events
-        res.set_header("Content-Type", "text/event-stream");
-        res.set_header("Cache-Control", "no-cache");
-        std::string sse_body;
-        for (const auto& r : responses) {
-            sse_body += "event: message\r\ndata: " + r.dump() + "\r\n\r\n";
-        }
-        res.set_content(sse_body, "text/event-stream");
-        return;
-    }
-
-    // Single response or client prefers JSON
+    // Non-initialize request with an id: process synchronously and return inline JSON.
+    auto mcp_req = parse_jsonrpc_message(body);
+    json result = process_request(mcp_req, session_id);
     res.set_header("Content-Type", "application/json");
-    if (responses.size() == 1) {
-        res.set_content(responses[0].dump(), "application/json");
-    } else {
-        // Batch response
-        res.set_content(responses.dump(), "application/json");
-    }
+    res.set_content(result.dump(), "application/json");
 }
 
 void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res) {
+    if (!origin_is_allowed(req)) {
+        res.status = 403;
+        res.set_content("{\"error\":\"Forbidden origin\"}", "application/json");
+        return;
+    }
     // CORS headers
     res.set_header("Access-Control-Allow-Origin", "*");
-    res.set_header("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id");
-    res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id");
-
+    res.set_header("Access-Control-Allow-Headers",
+                   "Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version");
+    res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id, MCP-Protocol-Version");
 
     std::string session_id = req.get_header_value("Mcp-Session-Id");
+    {
+        std::string ver = !session_id.empty() ? session_protocol_version(session_id) : "";
+        if (ver.empty()) ver = LATEST_MCP_VERSION;
+        res.set_header("MCP-Protocol-Version", ver);
+    }
     if (session_id.empty()) {
         res.status = 400;
         res.set_content("{\"error\":\"Missing Mcp-Session-Id header\"}", "application/json");
@@ -1109,6 +1133,16 @@ void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res)
     if (!is_session_initialized(session_id)) {
         res.status = 400;
         res.set_content("{\"error\":\"Session not initialized\"}", "application/json");
+        return;
+    }
+
+    auto [vstatus, vmsg] = validate_protocol_version_header(req, session_id);
+    if (vstatus != 200) {
+        res.status = vstatus;
+        res.set_content(
+            response::create_error(nullptr, error_code::invalid_request, vmsg)
+                .to_json().dump(),
+            "application/json");
         return;
     }
 
@@ -1150,9 +1184,19 @@ void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res)
 }
 
 void server::handle_mcp_delete(const httplib::Request& req, httplib::Response& res) {
+    if (!origin_is_allowed(req)) {
+        res.status = 403;
+        res.set_content("{\"error\":\"Forbidden origin\"}", "application/json");
+        return;
+    }
     res.set_header("Access-Control-Allow-Origin", "*");
 
     std::string session_id = req.get_header_value("Mcp-Session-Id");
+    {
+        std::string ver = !session_id.empty() ? session_protocol_version(session_id) : "";
+        if (ver.empty()) ver = LATEST_MCP_VERSION;
+        res.set_header("MCP-Protocol-Version", ver);
+    }
     if (session_id.empty()) {
         res.status = 400;
         return;
@@ -1164,6 +1208,16 @@ void server::handle_mcp_delete(const httplib::Request& req, httplib::Response& r
             res.status = 404;
             return;
         }
+    }
+
+    auto [vstatus, vmsg] = validate_protocol_version_header(req, session_id);
+    if (vstatus != 200) {
+        res.status = vstatus;
+        res.set_content(
+            response::create_error(nullptr, error_code::invalid_request, vmsg)
+                .to_json().dump(),
+            "application/json");
+        return;
     }
 
     close_session(session_id);
@@ -1302,12 +1356,16 @@ json server::handle_initialize(const request& req, const std::string& session_id
     std::string requested_version = params["protocolVersion"].get<std::string>();
     LOG_INFO("Client requested protocol version: ", requested_version);
 
-    // Per 2025-03-26 spec: if client requests a version we don't support,
-    // respond with the latest version we DO support and let the client decide.
-    std::string negotiated_version = MCP_VERSION;
-    if (requested_version != MCP_VERSION) {
-        LOG_WARNING("Client requested version ", requested_version,
-                    ", server supports ", MCP_VERSION, ". Responding with server version.");
+    // Spec: if the client requests a version we support, return that version;
+    // otherwise return our latest supported version and let the client decide
+    // whether to disconnect.
+    std::string negotiated_version;
+    if (is_supported_version(requested_version)) {
+        negotiated_version = requested_version;
+    } else {
+        LOG_WARNING("Client requested unsupported version ", requested_version,
+                    ", falling back to latest ", LATEST_MCP_VERSION);
+        negotiated_version = LATEST_MCP_VERSION;
     }
 
     // Extract client info
@@ -1331,6 +1389,11 @@ json server::handle_initialize(const request& req, const std::string& session_id
         {"name", name_},
         {"version", version_}
     };
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        session_protocol_versions_[session_id] = negotiated_version;
+    }
 
     json result = {
         {"protocolVersion", negotiated_version},
@@ -1488,6 +1551,15 @@ bool server::is_cancelled(const json& request_id, const std::string& session_id)
     return it->second.count(request_id.dump()) > 0;
 }
 
+std::string server::session_protocol_version(const std::string& session_id) const {
+    if (session_id.empty()) {
+        return "";
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = session_protocol_versions_.find(session_id);
+    return it != session_protocol_versions_.end() ? it->second : "";
+}
+
 bool server::is_session_initialized(const std::string& session_id) const {
     // Check if session ID is valid
     if (session_id.empty()) {
@@ -1615,6 +1687,7 @@ void server::close_session(const std::string& session_id) {
         session_dispatchers_.erase(dispatcher_it);
 
         session_initialized_.erase(session_id);
+        session_protocol_versions_.erase(session_id);
         session_log_levels_.erase(session_id);
         cancelled_requests_.erase(session_id);
 
