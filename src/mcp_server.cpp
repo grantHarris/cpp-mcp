@@ -691,13 +691,17 @@ void server::handle_sse(const httplib::Request& req, httplib::Response& res) {
             // Update activity time (after sending message)
             session_dispatcher->update_activity();
             
-            // Send periodic heartbeats to detect connection status. Use an
-            // interruptible wait so server::stop() (which calls dispatcher
-            // close()) can wake this thread immediately — previously a naked
-            // sleep_for(5s) meant stop() had to either wait up to 5s or
-            // detach the thread (hazardous: detached thread outlives server
-            // and crashes on use-after-free).
-            int heartbeat_count = 0;
+            // Periodic SSE keepalives. Use bare ":" comments rather than a
+            // custom "event: heartbeat" so spec-compliant clients ignore them
+            // outright; some MCP clients treat unknown event types as
+            // protocol violations and tear down the stream, which we saw on
+            // the Aurora device producing ~30-55s session lifetimes.
+            //
+            // Uses an interruptible wait so server::stop() (which calls
+            // dispatcher close()) can wake this thread immediately —
+            // previously a naked sleep_for(5s) meant stop() had to either
+            // wait up to 5s or detach the thread (hazardous: detached thread
+            // outlives server and crashes on use-after-free).
             while (running_ && !session_dispatcher->is_closed()) {
                 auto timeout = std::chrono::seconds(5) +
                                std::chrono::milliseconds(rand() % 500);
@@ -708,21 +712,16 @@ void server::handle_sse(const httplib::Request& req, httplib::Response& res) {
                 if (session_dispatcher->is_closed() || !running_) {
                     break;
                 }
-                
-                std::stringstream heartbeat;
-                heartbeat << "event: heartbeat\r\ndata: " << heartbeat_count++ << "\r\n\r\n";
-                
+
                 try {
-                    bool sent = session_dispatcher->send_event(heartbeat.str());
+                    bool sent = session_dispatcher->send_event(":\n\n");
                     if (!sent) {
-                        LOG_WARNING("Failed to send heartbeat, client may have closed connection: ", session_id);
+                        LOG_WARNING("Failed to send keepalive, client may have closed connection: ", session_id);
                         break;
                     }
-                    
-                    // Update activity time (heartbeat successful)
                     session_dispatcher->update_activity();
                 } catch (const std::exception& e) {
-                    LOG_ERROR("Failed to send heartbeat: ", e.what());
+                    LOG_ERROR("Failed to send keepalive: ", e.what());
                     break;
                 }
             }
