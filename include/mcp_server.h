@@ -30,6 +30,7 @@
 #include <condition_variable>
 #include <future>
 #include <atomic>
+#include <deque>
 #include <optional>
 
 
@@ -79,10 +80,14 @@ using prompt_handler = std::function<json(const json& arguments, const std::stri
 
 class event_dispatcher {
 public:
-    event_dispatcher() {
-        message_.reserve(128); // Pre-allocate space for messages
-    }
-    
+    // Bound on queued-but-unsent events. The queue holds events while the SSE
+    // consumer is between wait_event() calls. Heartbeats every 5s + occasional
+    // tool responses won't approach this — but if the consumer truly stalls
+    // (slow socket, dead connection), bounding prevents unbounded growth.
+    static constexpr size_t MAX_QUEUED_EVENTS = 256;
+
+    event_dispatcher() = default;
+
     ~event_dispatcher() {
         close();
     }
@@ -100,10 +105,15 @@ public:
                 return false;
             }
 
-            int id = id_.load(std::memory_order_relaxed);
-
-            bool result = cv_.wait_for(lk, timeout, [&] {
-                return cid_.load(std::memory_order_relaxed) == id || closed_.load(std::memory_order_acquire);
+            // Predicate is now "queue has data or we're shutting down" rather
+            // than "id counter == captured snapshot". The old strict-equality
+            // predicate was racy: if two send_event() calls fired between
+            // consume cycles, cid_ skipped past the consumer's snapshot and
+            // the consumer waited forever for a value that would never come,
+            // while the second message also overwrote the first in the
+            // single-slot message_ buffer (so the first event was lost).
+            bool result = cv_.wait_for(lk, timeout, [this] {
+                return !queue_.empty() || closed_.load(std::memory_order_acquire);
             });
 
             if (closed_.load(std::memory_order_acquire)) {
@@ -125,11 +135,15 @@ public:
                 return true;
             }
 
-            // Only copy the message if there is one
-            if (!message_.empty()) {
-                message_copy.swap(message_);
+            // Pop exactly one event per wait_event call. The chunked content
+            // provider loops, so multiple queued events drain across
+            // successive calls in FIFO order.
+            if (!queue_.empty()) {
+                message_copy = std::move(queue_.front());
+                queue_.pop_front();
             } else {
-                return true; // No message but condition satisfied
+                // closed_ was the signal; handled above.
+                return true;
             }
         }
 
@@ -151,21 +165,23 @@ public:
         if (closed_.load(std::memory_order_acquire) || message.empty()) {
             return false;
         }
-        
+
         try {
             std::lock_guard<std::mutex> lk(m_);
-            
+
             if (closed_.load(std::memory_order_acquire)) {
                 return false;
             }
-            
-            // Efficiently set the message and allocate space as needed
-            if (message.size() > message_.capacity()) {
-                message_.reserve(message.size() + 64); // Pre-allocate extra space to avoid frequent reallocations
+
+            // Drop on overflow. Returning false signals the caller (heartbeat
+            // loop / tool response thread) that the connection is wedged so
+            // they can decide whether to close it. Silently dropping would
+            // mask a stuck consumer.
+            if (queue_.size() >= MAX_QUEUED_EVENTS) {
+                return false;
             }
-            message_ = message;
-            
-            cid_.store(id_.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
+
+            queue_.push_back(message);
             // notify_all — multiple threads may wait on cv_ (wait_event +
             // wait_for_close) with different predicates. notify_one could
             // wake the "wrong" thread (e.g. a heartbeat sleeper), which
@@ -219,9 +235,7 @@ public:
 private:
     mutable std::mutex m_;
     std::condition_variable cv_;
-    std::atomic<int> id_{0};
-    std::atomic<int> cid_{-1};
-    std::string message_;
+    std::deque<std::string> queue_;
     std::atomic<bool> closed_{false};
     std::chrono::steady_clock::time_point last_activity_{std::chrono::steady_clock::now()};
 };
