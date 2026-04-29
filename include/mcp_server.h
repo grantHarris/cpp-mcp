@@ -282,6 +282,19 @@ public:
 
         unsigned int threadpool_size{ std::thread::hardware_concurrency() };
 
+        /**
+         * Number of worker threads in cpp-httplib's task queue. Each active
+         * SSE stream parks ONE httplib worker for its entire lifetime
+         * (the chunked content provider blocks in wait_event). Httplib's own
+         * default is max(8, hardware_concurrency()-1), which is too tight for
+         * MCP: an embedded device with 4 cores gets 8 workers, and a single
+         * client with multiple subscriptions can park most of them, leaving
+         * no capacity to handle new POST traffic. Resulting symptom is "Failed
+         * to reconnect" — the server appears hung. Default to 64 to give
+         * generous headroom on top of max_sessions.
+         */
+        unsigned int http_thread_pool_size{ 64 };
+
         /** Maximum concurrent sessions (0 = unlimited) */
         unsigned int max_sessions{ MCP_MAX_SESSIONS };
 
@@ -594,6 +607,10 @@ private:
 
     // Origin allowlist (empty = no Origin check)
     std::vector<std::string> allowed_origins_;
+
+    // Number of httplib worker threads (set on http_server_->new_task_queue
+    // before listen()).
+    unsigned int http_thread_pool_size_ = 64;
 
     // Legacy HTTP+SSE transport (2024-11-05)
     void handle_sse(const httplib::Request& req, httplib::Response& res);
