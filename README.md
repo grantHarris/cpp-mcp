@@ -1,6 +1,6 @@
 # MCP Protocol Framework
 
-[Model Context Protocol (MCP)](https://modelcontextprotocol.io/specification/2025-03-26) is an open protocol that provides a standardized way for AI models and agents to interact with various resources, tools, and services. This framework implements the core functionality of the MCP protocol, conforming to the **2025-03-26** protocol specification.
+[Model Context Protocol (MCP)](https://modelcontextprotocol.io/specification/2025-11-25) is an open protocol that provides a standardized way for AI models and agents to interact with various resources, tools, and services. This framework implements the core functionality of the MCP protocol, conforming to the **2025-11-25** protocol specification (also negotiates 2025-06-18 and 2025-03-26 with older clients).
 
 ## Core Features
 
@@ -63,7 +63,7 @@ target_link_libraries(my_app PRIVATE mcp)
 
 The server supports two transports simultaneously:
 
-- **Streamable HTTP** (2025-03-26): `POST /mcp` for requests, `GET /mcp` for SSE server-push, `DELETE /mcp` for session termination. Sessions are identified by the `Mcp-Session-Id` header.
+- **Streamable HTTP** (2025-03-26 onward): `POST /mcp` for requests, `GET /mcp` for SSE server-push, `DELETE /mcp` for session termination. Sessions are identified by the `Mcp-Session-Id` header. After `initialize`, clients send `MCP-Protocol-Version` on every request (per 2025-06-18); JSON-RPC batching is **not** supported.
 - **Legacy HTTP+SSE** (2024-11-05): `GET /sse` opens an SSE stream that delivers an endpoint URL, then `POST /message?session_id=...` for JSON-RPC messages.
 
 ### Client (`mcp_sse_client.h`, `mcp_stdio_client.h`)
@@ -116,6 +116,7 @@ conf.host = "0.0.0.0";
 conf.port = 8080;
 conf.max_sessions = 20;        // Override default
 conf.session_timeout = 60;     // 60s idle timeout
+conf.allowed_origins = {"http://localhost:3000"};  // empty = no Origin check
 
 mcp::server srv(conf);
 srv.set_server_info("My Server", "1.0.0");
