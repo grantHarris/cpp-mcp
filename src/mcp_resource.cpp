@@ -343,22 +343,29 @@ bool resource_manager::unsubscribe(int subscription_id) {
 }
 
 void resource_manager::notify_resource_changed(const std::string& uri) {
-    std::lock_guard<std::mutex> lock(g_resource_manager_mutex);
-    
-    // Check if resource exists
-    auto it = resources_.find(uri);
-    if (it == resources_.end()) {
-        return;
-    }
-    
-    // Notify all subscribers for this resource
-    for (const auto& [id, sub] : subscriptions_) {
-        if (sub.first == uri) {
-            try {
-                sub.second(uri);
-            } catch (...) {
-                // Ignore exceptions in callbacks
+    // Snapshot matching callbacks under the lock so we can invoke them
+    // outside it. Callbacks are arbitrary user code and may call back into
+    // the manager (subscribe / unsubscribe / list_resources / get_resource);
+    // doing that while holding the non-recursive g_resource_manager_mutex
+    // would self-deadlock the calling thread.
+    std::vector<std::function<void(const std::string&)>> callbacks;
+    {
+        std::lock_guard<std::mutex> lock(g_resource_manager_mutex);
+        if (resources_.find(uri) == resources_.end()) {
+            return;
+        }
+        for (const auto& [id, sub] : subscriptions_) {
+            if (sub.first == uri) {
+                callbacks.push_back(sub.second);
             }
+        }
+    }
+
+    for (auto& cb : callbacks) {
+        try {
+            cb(uri);
+        } catch (...) {
+            // Ignore exceptions in callbacks
         }
     }
 }
