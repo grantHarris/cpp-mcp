@@ -31,6 +31,7 @@ server::server(const server::configuration& conf)
     , max_sessions_(conf.max_sessions)
     , session_timeout_(conf.session_timeout)
     , allowed_origins_(conf.allowed_origins)
+    , http_thread_pool_size_(conf.http_thread_pool_size > 0 ? conf.http_thread_pool_size : 64)
 {
     #ifdef MCP_SSL
     if (conf.ssl.server_cert_path && conf.ssl.server_private_key_path) {
@@ -50,6 +51,18 @@ server::server(const server::configuration& conf)
     #else
      http_server_ = std::make_unique<httplib::Server>();
     #endif
+
+    // Override httplib's default task queue (max(8, hardware_concurrency()-1)).
+    // Each active SSE chunked content provider parks one httplib worker for
+    // the lifetime of the stream, which on small embedded hosts (4-core
+    // NanoPi) means a handful of concurrent clients can starve the server of
+    // capacity to handle anything else — including the POST traffic those
+    // same SSE clients depend on. Setting our own pool size decouples the
+    // ceiling from hardware_concurrency.
+    unsigned int pool_size = http_thread_pool_size_;
+    http_server_->new_task_queue = [pool_size]() {
+        return new httplib::ThreadPool(pool_size);
+    };
 }
 
 server::~server() {
