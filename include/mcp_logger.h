@@ -76,12 +76,18 @@ private:
         
         std::stringstream ss;
         
-        // Add timestamp
+        // Add timestamp. std::localtime returns a pointer to a shared static
+        // buffer, so concurrent loggers race on it; use the thread-safe variants.
         auto now = std::chrono::system_clock::now();
         auto now_c = std::chrono::system_clock::to_time_t(now);
-        auto now_tm = std::localtime(&now_c);
-        
-        ss << std::put_time(now_tm, "%Y-%m-%d %H:%M:%S") << " ";
+        std::tm now_tm{};
+#ifdef _WIN32
+        localtime_s(&now_tm, &now_c);
+#else
+        localtime_r(&now_c, &now_tm);
+#endif
+
+        ss << std::put_time(&now_tm, "%Y-%m-%d %H:%M:%S") << " ";
         
         // Add log level and color
         switch (level) {
