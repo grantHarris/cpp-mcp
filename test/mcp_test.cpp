@@ -400,6 +400,63 @@ TEST_F(ServerTest, NotificationReturns202) {
     EXPECT_EQ(res["_status"], 202);
 }
 
+// MCP-Protocol-Version header (spec 2025-06-18). Server must emit it on
+// every response and validate it on post-init Streamable HTTP requests.
+TEST_F(ServerTest, InitializeResponseSendsProtocolVersionHeader) {
+    json init_req = {
+        {"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"},
+        {"params", {
+            {"protocolVersion", "2025-11-25"},
+            {"clientInfo", {{"name", "T"}, {"version", "1"}}},
+            {"capabilities", json::object()}
+        }}
+    };
+    httplib::Headers h = {
+        {"Content-Type", "application/json"},
+        {"Accept", "application/json, text/event-stream"}
+    };
+    auto res = cli_->Post("/mcp", h, init_req.dump(), "application/json");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 200);
+    EXPECT_EQ(res->get_header_value("MCP-Protocol-Version"), "2025-11-25");
+}
+
+TEST_F(ServerTest, RejectsMismatchedProtocolVersionHeader) {
+    auto [sid, _] = mcp_initialize(*cli_);  // negotiates LATEST_MCP_VERSION
+    httplib::Headers h = {
+        {"Content-Type", "application/json"},
+        {"Accept", "application/json, text/event-stream"},
+        {"Mcp-Session-Id", sid},
+        {"MCP-Protocol-Version", "2025-03-26"}  // mismatch
+    };
+    json ping = {{"jsonrpc", "2.0"}, {"id", 99}, {"method", "ping"}};
+    auto res = cli_->Post("/mcp", h, ping.dump(), "application/json");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 400);
+}
+
+TEST_F(ServerTest, RejectsUnknownProtocolVersionHeader) {
+    auto [sid, _] = mcp_initialize(*cli_);
+    httplib::Headers h = {
+        {"Content-Type", "application/json"},
+        {"Accept", "application/json, text/event-stream"},
+        {"Mcp-Session-Id", sid},
+        {"MCP-Protocol-Version", "1999-01-01"}
+    };
+    json ping = {{"jsonrpc", "2.0"}, {"id", 99}, {"method", "ping"}};
+    auto res = cli_->Post("/mcp", h, ping.dump(), "application/json");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 400);
+}
+
+TEST_F(ServerTest, AcceptsMissingProtocolVersionHeader) {
+    // Spec compat: missing header implies 2025-03-26. We allow it through.
+    auto [sid, _] = mcp_initialize(*cli_);
+    json ping = {{"jsonrpc", "2.0"}, {"id", 99}, {"method", "ping"}};
+    auto res = mcp_post(*cli_, "/mcp", ping, sid);  // helper omits the header
+    EXPECT_EQ(res["_status"], 200);
+}
+
 // Spec 2025-06-18 removed JSON-RPC batching. Servers MUST reject array bodies.
 TEST_F(ServerTest, BatchRejected) {
     auto [sid, _] = mcp_initialize(*cli_);

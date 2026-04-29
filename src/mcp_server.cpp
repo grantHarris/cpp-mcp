@@ -882,6 +882,26 @@ void server::handle_jsonrpc(const httplib::Request& req, httplib::Response& res)
 // Streamable HTTP transport (2025-03-26 spec)
 // ---------------------------------------------------------------------------
 
+std::pair<int, std::string>
+server::validate_protocol_version_header(const httplib::Request& req,
+                                         const std::string& session_id) const {
+    std::string header = req.get_header_value("MCP-Protocol-Version");
+    if (header.empty()) {
+        // Spec compat: missing header implies 2025-03-26.
+        return {200, ""};
+    }
+    if (!is_supported_version(header)) {
+        return {400, "Unsupported MCP-Protocol-Version: " + header};
+    }
+    std::string negotiated = session_protocol_version(session_id);
+    if (!negotiated.empty() && header != negotiated) {
+        return {400,
+            "MCP-Protocol-Version header (" + header +
+            ") does not match negotiated session version (" + negotiated + ")"};
+    }
+    return {200, ""};
+}
+
 request server::parse_jsonrpc_message(const json& j) const {
     request req;
     req.jsonrpc = j.value("jsonrpc", "2.0");
@@ -901,8 +921,17 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
     // CORS headers
     res.set_header("Access-Control-Allow-Origin", "*");
     res.set_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-    res.set_header("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id");
-    res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id");
+    res.set_header("Access-Control-Allow-Headers",
+                   "Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version");
+    res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id, MCP-Protocol-Version");
+
+    // Reflect the protocol version of this exchange on every response.
+    {
+        std::string sid = req.get_header_value("Mcp-Session-Id");
+        std::string ver = !sid.empty() ? session_protocol_version(sid) : "";
+        if (ver.empty()) ver = LATEST_MCP_VERSION;
+        res.set_header("MCP-Protocol-Version", ver);
+    }
 
     // Parse JSON body
     json body;
@@ -955,11 +984,22 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
             res.set_content("{\"error\":\"Missing Mcp-Session-Id header\"}", "application/json");
             return;
         }
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (session_dispatchers_.find(session_id) == session_dispatchers_.end()) {
-            // Session expired or invalid — client must re-initialize
-            res.status = 404;
-            res.set_content("{\"error\":\"Session not found\"}", "application/json");
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (session_dispatchers_.find(session_id) == session_dispatchers_.end()) {
+                // Session expired or invalid — client must re-initialize
+                res.status = 404;
+                res.set_content("{\"error\":\"Session not found\"}", "application/json");
+                return;
+            }
+        }
+        auto [vstatus, vmsg] = validate_protocol_version_header(req, session_id);
+        if (vstatus != 200) {
+            res.status = vstatus;
+            res.set_content(
+                response::create_error(nullptr, error_code::invalid_request, vmsg)
+                    .to_json().dump(),
+                "application/json");
             return;
         }
     }
@@ -1002,6 +1042,12 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
         json result = handle_initialize(mcp_req, session_id);
 
         res.set_header("Mcp-Session-Id", session_id);
+        // Override the placeholder set at the top of the handler now that we
+        // know what version was negotiated.
+        std::string negotiated = session_protocol_version(session_id);
+        if (!negotiated.empty()) {
+            res.set_header("MCP-Protocol-Version", negotiated);
+        }
         res.set_header("Content-Type", "application/json");
         res.set_content(result.dump(), "application/json");
         return;
@@ -1017,11 +1063,16 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
 void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res) {
     // CORS headers
     res.set_header("Access-Control-Allow-Origin", "*");
-    res.set_header("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id");
-    res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id");
-
+    res.set_header("Access-Control-Allow-Headers",
+                   "Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version");
+    res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id, MCP-Protocol-Version");
 
     std::string session_id = req.get_header_value("Mcp-Session-Id");
+    {
+        std::string ver = !session_id.empty() ? session_protocol_version(session_id) : "";
+        if (ver.empty()) ver = LATEST_MCP_VERSION;
+        res.set_header("MCP-Protocol-Version", ver);
+    }
     if (session_id.empty()) {
         res.status = 400;
         res.set_content("{\"error\":\"Missing Mcp-Session-Id header\"}", "application/json");
@@ -1044,6 +1095,16 @@ void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res)
     if (!is_session_initialized(session_id)) {
         res.status = 400;
         res.set_content("{\"error\":\"Session not initialized\"}", "application/json");
+        return;
+    }
+
+    auto [vstatus, vmsg] = validate_protocol_version_header(req, session_id);
+    if (vstatus != 200) {
+        res.status = vstatus;
+        res.set_content(
+            response::create_error(nullptr, error_code::invalid_request, vmsg)
+                .to_json().dump(),
+            "application/json");
         return;
     }
 
@@ -1088,6 +1149,11 @@ void server::handle_mcp_delete(const httplib::Request& req, httplib::Response& r
     res.set_header("Access-Control-Allow-Origin", "*");
 
     std::string session_id = req.get_header_value("Mcp-Session-Id");
+    {
+        std::string ver = !session_id.empty() ? session_protocol_version(session_id) : "";
+        if (ver.empty()) ver = LATEST_MCP_VERSION;
+        res.set_header("MCP-Protocol-Version", ver);
+    }
     if (session_id.empty()) {
         res.status = 400;
         return;
@@ -1099,6 +1165,16 @@ void server::handle_mcp_delete(const httplib::Request& req, httplib::Response& r
             res.status = 404;
             return;
         }
+    }
+
+    auto [vstatus, vmsg] = validate_protocol_version_header(req, session_id);
+    if (vstatus != 200) {
+        res.status = vstatus;
+        res.set_content(
+            response::create_error(nullptr, error_code::invalid_request, vmsg)
+                .to_json().dump(),
+            "application/json");
+        return;
     }
 
     close_session(session_id);

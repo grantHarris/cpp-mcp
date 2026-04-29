@@ -593,6 +593,13 @@ private:
     void handle_mcp_get(const httplib::Request& req, httplib::Response& res);
     void handle_mcp_delete(const httplib::Request& req, httplib::Response& res);
 
+    // Returns a (status, message) pair if the request must be rejected, or
+    // empty string in .second if the header is acceptable. Missing header is
+    // treated as the legacy 2025-03-26 client (per spec compat note).
+    std::pair<int, std::string>
+    validate_protocol_version_header(const httplib::Request& req,
+                                     const std::string& session_id) const;
+
     // Parse a single JSON-RPC message from JSON
     request parse_jsonrpc_message(const json& j) const;
 
