@@ -1302,12 +1302,16 @@ json server::handle_initialize(const request& req, const std::string& session_id
     std::string requested_version = params["protocolVersion"].get<std::string>();
     LOG_INFO("Client requested protocol version: ", requested_version);
 
-    // Per 2025-03-26 spec: if client requests a version we don't support,
-    // respond with the latest version we DO support and let the client decide.
-    std::string negotiated_version = MCP_VERSION;
-    if (requested_version != MCP_VERSION) {
-        LOG_WARNING("Client requested version ", requested_version,
-                    ", server supports ", MCP_VERSION, ". Responding with server version.");
+    // Spec: if the client requests a version we support, return that version;
+    // otherwise return our latest supported version and let the client decide
+    // whether to disconnect.
+    std::string negotiated_version;
+    if (is_supported_version(requested_version)) {
+        negotiated_version = requested_version;
+    } else {
+        LOG_WARNING("Client requested unsupported version ", requested_version,
+                    ", falling back to latest ", LATEST_MCP_VERSION);
+        negotiated_version = LATEST_MCP_VERSION;
     }
 
     // Extract client info
@@ -1331,6 +1335,11 @@ json server::handle_initialize(const request& req, const std::string& session_id
         {"name", name_},
         {"version", version_}
     };
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        session_protocol_versions_[session_id] = negotiated_version;
+    }
 
     json result = {
         {"protocolVersion", negotiated_version},
@@ -1488,6 +1497,15 @@ bool server::is_cancelled(const json& request_id, const std::string& session_id)
     return it->second.count(request_id.dump()) > 0;
 }
 
+std::string server::session_protocol_version(const std::string& session_id) const {
+    if (session_id.empty()) {
+        return "";
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = session_protocol_versions_.find(session_id);
+    return it != session_protocol_versions_.end() ? it->second : "";
+}
+
 bool server::is_session_initialized(const std::string& session_id) const {
     // Check if session ID is valid
     if (session_id.empty()) {
@@ -1615,6 +1633,7 @@ void server::close_session(const std::string& session_id) {
         session_dispatchers_.erase(dispatcher_it);
 
         session_initialized_.erase(session_id);
+        session_protocol_versions_.erase(session_id);
         session_log_levels_.erase(session_id);
         cancelled_requests_.erase(session_id);
 

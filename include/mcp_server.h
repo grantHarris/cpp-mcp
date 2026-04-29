@@ -488,6 +488,14 @@ public:
     bool is_cancelled(const json& request_id, const std::string& session_id) const;
 
     /**
+     * @brief Get the negotiated MCP protocol version for a session
+     * @param session_id The session ID to query
+     * @return The version string the server agreed to during initialize, or
+     *         empty if the session is unknown or not yet initialized.
+     */
+    std::string session_protocol_version(const std::string& session_id) const;
+
+    /**
      * @brief Set mount point for server
      * @param mount_point The mount point to set
      * @param dir The directory to serve from the mount point
@@ -572,6 +580,9 @@ private:
     
     // Map to track session initialization status (session_id -> initialized)
     std::map<std::string, bool> session_initialized_;
+
+    // Map to track per-session negotiated MCP protocol version
+    std::map<std::string, std::string> session_protocol_versions_;
 
     // Legacy HTTP+SSE transport (2024-11-05)
     void handle_sse(const httplib::Request& req, httplib::Response& res);

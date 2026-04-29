@@ -298,7 +298,7 @@ TEST_F(ServerTest, InitializeReturnsSessionId) {
     EXPECT_EQ(body["result"]["serverInfo"]["name"], "TestServer");
 }
 
-TEST_F(ServerTest, InitializeVersionNegotiation) {
+TEST_F(ServerTest, InitializeUnsupportedVersionFallsBackToLatest) {
     json req = {
         {"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"},
         {"params", {
@@ -308,8 +308,37 @@ TEST_F(ServerTest, InitializeVersionNegotiation) {
         }}
     };
     auto res = mcp_post(*cli_, "/mcp", req);
-    // Server responds with its own version regardless
-    EXPECT_EQ(res["_body"]["result"]["protocolVersion"], MCP_VERSION);
+    // Unknown version → server falls back to its latest supported.
+    EXPECT_EQ(res["_body"]["result"]["protocolVersion"], LATEST_MCP_VERSION);
+}
+
+TEST_F(ServerTest, InitializeNegotiatesClientRequestedVersion) {
+    // 2025-06-18 is in our supported set; server should echo it back.
+    json req = {
+        {"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"},
+        {"params", {
+            {"protocolVersion", "2025-06-18"},
+            {"clientInfo", {{"name", "Mid"}, {"version", "1.0"}}},
+            {"capabilities", json::object()}
+        }}
+    };
+    auto res = mcp_post(*cli_, "/mcp", req);
+    EXPECT_EQ(res["_body"]["result"]["protocolVersion"], "2025-06-18");
+}
+
+TEST_F(ServerTest, InitializeStoresNegotiatedVersionPerSession) {
+    json req = {
+        {"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"},
+        {"params", {
+            {"protocolVersion", "2025-03-26"},
+            {"clientInfo", {{"name", "Old"}, {"version", "1.0"}}},
+            {"capabilities", json::object()}
+        }}
+    };
+    auto res = mcp_post(*cli_, "/mcp", req);
+    std::string sid = res.value("_session_id", "");
+    ASSERT_FALSE(sid.empty());
+    EXPECT_EQ(srv_->session_protocol_version(sid), "2025-03-26");
 }
 
 TEST_F(ServerTest, PingAfterInitialize) {
