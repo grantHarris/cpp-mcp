@@ -8,6 +8,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <future>
 #include "mcp_message.h"
 #include "mcp_server.h"
 #include "mcp_tool.h"
@@ -990,6 +991,96 @@ TEST_F(ServerTest, BroadcastNotification) {
     // Just verify it doesn't crash — actual delivery requires SSE stream
     auto notif = request::create_notification("test_event", {{"data", "hello"}});
     EXPECT_NO_THROW(srv_->broadcast_notification(notif));
+}
+
+// ===========================================================================
+// resource_manager: callbacks must not run under the manager's mutex,
+// so reentrant subscribe/unsubscribe/notify don't self-deadlock.
+// ===========================================================================
+
+// Helper: run `fn` on a background thread. If it doesn't finish within
+// `timeout`, detach it (leaking the thread) and return false. Used to test
+// for deadlocks without hanging the whole suite. NOTE: detached deadlocked
+// threads hold whatever locks they were stuck on, so subsequent tests in
+// the same process that touch the same locks may be affected. Acceptable
+// here because these regression tests verify the fix is in place; if they
+// fail, the suite is already in a degraded state and needs developer
+// attention regardless.
+static bool run_with_timeout(std::function<void()> fn,
+                             std::chrono::milliseconds timeout) {
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    std::thread t([fn = std::move(fn), done]() {
+        fn();
+        done->store(true);
+    });
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!done->load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (done->load()) {
+        t.join();
+        return true;
+    }
+    t.detach();
+    return false;
+}
+
+TEST(ResourceManagerReentrancy, CallbackCanUnsubscribeWithoutDeadlocking) {
+    // Regression: notify_resource_changed() used to invoke subscriber
+    // callbacks while holding g_resource_manager_mutex. Any callback that
+    // touched the manager (subscribe/unsubscribe/list_resources/get_resource)
+    // would re-lock the same non-recursive mutex and hard-deadlock.
+    auto& mgr = resource_manager::instance();
+
+    auto res = std::make_shared<text_resource>(
+        "test://reentry-unsub", "reentry-unsub", "text/plain");
+    res->set_text("ok");
+    mgr.register_resource(res);
+
+    int sub_id = -1;
+    std::atomic<bool> called{false};
+    sub_id = mgr.subscribe(
+        "test://reentry-unsub",
+        [&](const std::string&) {
+            called.store(true);
+            mgr.unsubscribe(sub_id);  // would deadlock without the fix
+        });
+
+    bool finished = run_with_timeout(
+        [&]() { mgr.notify_resource_changed("test://reentry-unsub"); },
+        std::chrono::seconds(2));
+
+    ASSERT_TRUE(finished)
+        << "notify_resource_changed deadlocks when callback re-enters manager";
+    EXPECT_TRUE(called.load());
+    mgr.unregister_resource("test://reentry-unsub");
+}
+
+TEST(ResourceManagerReentrancy, CallbackCanListResourcesWithoutDeadlocking) {
+    auto& mgr = resource_manager::instance();
+    auto res = std::make_shared<text_resource>(
+        "test://reentry-list", "reentry-list", "text/plain");
+    res->set_text("ok");
+    mgr.register_resource(res);
+
+    std::atomic<bool> called{false};
+    int sub_id = mgr.subscribe(
+        "test://reentry-list",
+        [&](const std::string&) {
+            called.store(true);
+            (void)mgr.list_resources();  // would deadlock without the fix
+        });
+
+    bool finished = run_with_timeout(
+        [&]() { mgr.notify_resource_changed("test://reentry-list"); },
+        std::chrono::seconds(2));
+
+    ASSERT_TRUE(finished)
+        << "notify_resource_changed deadlocks when callback calls list_resources";
+    EXPECT_TRUE(called.load());
+
+    mgr.unsubscribe(sub_id);
+    mgr.unregister_resource("test://reentry-list");
 }
 
 // ===========================================================================
