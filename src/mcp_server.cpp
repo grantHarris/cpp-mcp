@@ -926,16 +926,15 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
         is_initialize = true;
     }
 
-    // Spec: initialize request MUST NOT be part of a JSON-RPC batch
+    // Spec 2025-06-18 removed JSON-RPC batching; reject array bodies outright.
     if (body.is_array()) {
-        for (const auto& item : body) {
-            if (item.is_object() && item.contains("method") && item["method"] == "initialize") {
-                res.status = 400;
-                res.set_content("{\"error\":\"Initialize request must not be batched\"}",
-                                "application/json");
-                return;
-            }
-        }
+        res.status = 400;
+        res.set_content(
+            response::create_error(nullptr, error_code::invalid_request,
+                                   "JSON-RPC batching is not supported (spec 2025-06-18+)")
+                .to_json().dump(),
+            "application/json");
+        return;
     }
 
     // Reject re-initialization on an existing session
@@ -965,33 +964,12 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
         }
     }
 
-    // Handle batched requests
-    std::vector<json> items;
-    if (body.is_array()) {
-        for (const auto& item : body) {
-            items.push_back(item);
-        }
-    } else {
-        items.push_back(body);
-    }
-
-    // Categorize: are there any requests (with id), or only notifications/responses?
-    bool has_requests = false;
-    bool all_notifications_or_responses = true;
-    for (const auto& item : items) {
-        if (item.contains("method") && item.contains("id") && !item["id"].is_null()) {
-            has_requests = true;
-            all_notifications_or_responses = false;
-        }
-    }
-
-    // If all notifications/responses, process and return 202
-    if (all_notifications_or_responses && !has_requests) {
-        for (const auto& item : items) {
-            auto mcp_req = parse_jsonrpc_message(item);
-            if (!session_id.empty()) {
-                process_request(mcp_req, session_id);
-            }
+    // Notifications and responses (no id, or id=null): fire and forget.
+    bool has_request_id = body.contains("id") && !body["id"].is_null();
+    if (!has_request_id) {
+        if (!session_id.empty()) {
+            auto mcp_req = parse_jsonrpc_message(body);
+            process_request(mcp_req, session_id);
         }
         res.status = 202;
         return;
@@ -1020,7 +998,7 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
             session_dispatchers_[session_id] = session_dispatcher;
         }
 
-        auto mcp_req = parse_jsonrpc_message(items[0]);
+        auto mcp_req = parse_jsonrpc_message(body);
         json result = handle_initialize(mcp_req, session_id);
 
         res.set_header("Mcp-Session-Id", session_id);
@@ -1029,54 +1007,11 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
         return;
     }
 
-    // Non-initialize requests: check Accept header to decide response mode
-    std::string accept = req.get_header_value("Accept");
-    bool client_accepts_sse = accept.find("text/event-stream") != std::string::npos;
-
-    // Process all items, collect responses for requests
-    json responses = json::array();
-    for (const auto& item : items) {
-        auto mcp_req = parse_jsonrpc_message(item);
-
-        if (mcp_req.is_notification()) {
-            // Fire-and-forget
-            process_request(mcp_req, session_id);
-            continue;
-        }
-
-        // Process request synchronously (inline response)
-        json result = process_request(mcp_req, session_id);
-        responses.push_back(result);
-    }
-
-    if (responses.empty()) {
-        res.status = 202;
-        return;
-    }
-
-    // If client accepts SSE and we might want to stream, use SSE
-    // For now, use inline JSON for simplicity — SSE streaming on POST
-    // can be added later for long-running operations
-    if (client_accepts_sse && responses.size() > 1) {
-        // Stream responses as SSE events
-        res.set_header("Content-Type", "text/event-stream");
-        res.set_header("Cache-Control", "no-cache");
-        std::string sse_body;
-        for (const auto& r : responses) {
-            sse_body += "event: message\r\ndata: " + r.dump() + "\r\n\r\n";
-        }
-        res.set_content(sse_body, "text/event-stream");
-        return;
-    }
-
-    // Single response or client prefers JSON
+    // Non-initialize request with an id: process synchronously and return inline JSON.
+    auto mcp_req = parse_jsonrpc_message(body);
+    json result = process_request(mcp_req, session_id);
     res.set_header("Content-Type", "application/json");
-    if (responses.size() == 1) {
-        res.set_content(responses[0].dump(), "application/json");
-    } else {
-        // Batch response
-        res.set_content(responses.dump(), "application/json");
-    }
+    res.set_content(result.dump(), "application/json");
 }
 
 void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res) {

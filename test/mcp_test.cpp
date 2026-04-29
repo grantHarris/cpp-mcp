@@ -400,19 +400,20 @@ TEST_F(ServerTest, NotificationReturns202) {
     EXPECT_EQ(res["_status"], 202);
 }
 
-TEST_F(ServerTest, BatchRequest) {
+// Spec 2025-06-18 removed JSON-RPC batching. Servers MUST reject array bodies.
+TEST_F(ServerTest, BatchRejected) {
     auto [sid, _] = mcp_initialize(*cli_);
     json batch = json::array({
         {{"jsonrpc", "2.0"}, {"id", 10}, {"method", "ping"}},
         {{"jsonrpc", "2.0"}, {"id", 11}, {"method", "ping"}}
     });
     auto res = mcp_post(*cli_, "/mcp", batch, sid);
-    // Should get back an array of two responses or SSE
-    int status = res["_status"];
-    EXPECT_TRUE(status == 200);
+    EXPECT_EQ(res["_status"], 400);
+    EXPECT_EQ(res["_body"]["error"]["code"].get<int>(),
+              static_cast<int>(error_code::invalid_request));
 }
 
-TEST_F(ServerTest, RejectInitializeInBatch) {
+TEST_F(ServerTest, BatchedInitializeRejected) {
     json batch = json::array({
         {{"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"},
          {"params", {{"protocolVersion", MCP_VERSION},
