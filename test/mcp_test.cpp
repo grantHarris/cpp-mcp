@@ -457,6 +457,82 @@ TEST_F(ServerTest, AcceptsMissingProtocolVersionHeader) {
     EXPECT_EQ(res["_status"], 200);
 }
 
+// Origin allowlist with HTTP 403 (spec 2025-11-25).
+namespace {
+struct OriginServer {
+    std::unique_ptr<server> srv;
+    std::unique_ptr<httplib::Client> cli;
+    int port;
+
+    explicit OriginServer(std::vector<std::string> allowlist) {
+        port = next_port();
+        server::configuration conf;
+        conf.host = "127.0.0.1";
+        conf.port = port;
+        conf.allowed_origins = std::move(allowlist);
+        srv = std::make_unique<server>(conf);
+        srv->start(false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        cli = std::make_unique<httplib::Client>("127.0.0.1", port);
+        cli->set_connection_timeout(2);
+        cli->set_read_timeout(5);
+    }
+    ~OriginServer() {
+        cli.reset();
+        if (srv) srv->stop();
+    }
+};
+
+httplib::Result post_init_with_origin(httplib::Client& c, const std::string& origin) {
+    json init = {{"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"},
+                 {"params", {{"protocolVersion", LATEST_MCP_VERSION},
+                             {"clientInfo", {{"name", "t"}, {"version", "0"}}},
+                             {"capabilities", json::object()}}}};
+    httplib::Headers h = {
+        {"Content-Type", "application/json"},
+        {"Accept", "application/json, text/event-stream"},
+        {"Origin", origin}
+    };
+    return c.Post("/mcp", h, init.dump(), "application/json");
+}
+}  // namespace
+
+TEST(OriginAllowlist, RejectsDisallowedOrigin) {
+    OriginServer s({"http://localhost:3000"});
+    auto resp = post_init_with_origin(*s.cli, "http://evil.example.com");
+    ASSERT_TRUE(resp);
+    EXPECT_EQ(resp->status, 403);
+}
+
+TEST(OriginAllowlist, AllowsListedOrigin) {
+    OriginServer s({"http://localhost:3000"});
+    auto resp = post_init_with_origin(*s.cli, "http://localhost:3000");
+    ASSERT_TRUE(resp);
+    EXPECT_EQ(resp->status, 200);
+}
+
+TEST(OriginAllowlist, EmptyAllowlistAllowsAllOrigins) {
+    OriginServer s({});
+    auto resp = post_init_with_origin(*s.cli, "http://anywhere.example.com");
+    ASSERT_TRUE(resp);
+    EXPECT_EQ(resp->status, 200);
+}
+
+TEST(OriginAllowlist, MissingOriginIsAllowed) {
+    OriginServer s({"http://localhost:3000"});
+    json init = {{"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"},
+                 {"params", {{"protocolVersion", LATEST_MCP_VERSION},
+                             {"clientInfo", {{"name", "t"}, {"version", "0"}}},
+                             {"capabilities", json::object()}}}};
+    httplib::Headers h = {
+        {"Content-Type", "application/json"},
+        {"Accept", "application/json, text/event-stream"}
+    };
+    auto resp = s.cli->Post("/mcp", h, init.dump(), "application/json");
+    ASSERT_TRUE(resp);
+    EXPECT_EQ(resp->status, 200);
+}
+
 // Spec 2025-06-18 removed JSON-RPC batching. Servers MUST reject array bodies.
 TEST_F(ServerTest, BatchRejected) {
     auto [sid, _] = mcp_initialize(*cli_);

@@ -288,6 +288,14 @@ public:
         /** Inactive session timeout in seconds (0 = disabled) */
         unsigned int session_timeout{ MCP_SESSION_TIMEOUT };
 
+        /**
+         * If non-empty, requests with an Origin header NOT in this set are
+         * rejected with HTTP 403 (DNS-rebinding protection per spec
+         * 2025-11-25). Empty means no Origin check, suitable for loopback or
+         * embedded deployments. Add e.g. "http://localhost:3000".
+         */
+        std::vector<std::string> allowed_origins;
+
         #ifdef MCP_SSL        
         /**
          * @brief SSL configuration settings.
@@ -584,6 +592,9 @@ private:
     // Map to track per-session negotiated MCP protocol version
     std::map<std::string, std::string> session_protocol_versions_;
 
+    // Origin allowlist (empty = no Origin check)
+    std::vector<std::string> allowed_origins_;
+
     // Legacy HTTP+SSE transport (2024-11-05)
     void handle_sse(const httplib::Request& req, httplib::Response& res);
     void handle_jsonrpc(const httplib::Request& req, httplib::Response& res);
@@ -599,6 +610,11 @@ private:
     std::pair<int, std::string>
     validate_protocol_version_header(const httplib::Request& req,
                                      const std::string& session_id) const;
+
+    // Returns true if the request's Origin header is allowed (or no allowlist
+    // is configured, or the header is absent — which non-browser clients
+    // typically omit).
+    bool origin_is_allowed(const httplib::Request& req) const;
 
     // Parse a single JSON-RPC message from JSON
     request parse_jsonrpc_message(const json& j) const;

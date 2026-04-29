@@ -30,6 +30,7 @@ server::server(const server::configuration& conf)
     , thread_pool_(conf.threadpool_size)
     , max_sessions_(conf.max_sessions)
     , session_timeout_(conf.session_timeout)
+    , allowed_origins_(conf.allowed_origins)
 {
     #ifdef MCP_SSL
     if (conf.ssl.server_cert_path && conf.ssl.server_private_key_path) {
@@ -636,6 +637,11 @@ void server::set_auth_handler(auth_handler handler) {
 }
 
 void server::handle_sse(const httplib::Request& req, httplib::Response& res) {
+    if (!origin_is_allowed(req)) {
+        res.status = 403;
+        res.set_content("{\"error\":\"Forbidden origin\"}", "application/json");
+        return;
+    }
     // Enforce session limit
     if (max_sessions_ > 0) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -764,12 +770,17 @@ void server::handle_sse(const httplib::Request& req, httplib::Response& res) {
 }
 
 void server::handle_jsonrpc(const httplib::Request& req, httplib::Response& res) {
+    if (!origin_is_allowed(req)) {
+        res.status = 403;
+        res.set_content("{\"error\":\"Forbidden origin\"}", "application/json");
+        return;
+    }
     // Setup response headers
     res.set_header("Content-Type", "application/json");
     res.set_header("Access-Control-Allow-Origin", "*");
     res.set_header("Access-Control-Allow-Methods", "POST, OPTIONS");
     res.set_header("Access-Control-Allow-Headers", "Content-Type");
-    
+
     // Handle OPTIONS request (CORS pre-flight)
     if (req.method == "OPTIONS") {
         res.status = 204; // No Content
@@ -882,6 +893,18 @@ void server::handle_jsonrpc(const httplib::Request& req, httplib::Response& res)
 // Streamable HTTP transport (2025-03-26 spec)
 // ---------------------------------------------------------------------------
 
+bool server::origin_is_allowed(const httplib::Request& req) const {
+    if (allowed_origins_.empty()) {
+        return true;  // unset = no check
+    }
+    std::string origin = req.get_header_value("Origin");
+    if (origin.empty()) {
+        return true;  // browsers omit for same-origin / non-browser clients
+    }
+    return std::find(allowed_origins_.begin(), allowed_origins_.end(), origin)
+           != allowed_origins_.end();
+}
+
 std::pair<int, std::string>
 server::validate_protocol_version_header(const httplib::Request& req,
                                          const std::string& session_id) const {
@@ -918,6 +941,11 @@ request server::parse_jsonrpc_message(const json& j) const {
 }
 
 void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res) {
+    if (!origin_is_allowed(req)) {
+        res.status = 403;
+        res.set_content("{\"error\":\"Forbidden origin\"}", "application/json");
+        return;
+    }
     // CORS headers
     res.set_header("Access-Control-Allow-Origin", "*");
     res.set_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
@@ -1061,6 +1089,11 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
 }
 
 void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res) {
+    if (!origin_is_allowed(req)) {
+        res.status = 403;
+        res.set_content("{\"error\":\"Forbidden origin\"}", "application/json");
+        return;
+    }
     // CORS headers
     res.set_header("Access-Control-Allow-Origin", "*");
     res.set_header("Access-Control-Allow-Headers",
@@ -1146,6 +1179,11 @@ void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res)
 }
 
 void server::handle_mcp_delete(const httplib::Request& req, httplib::Response& res) {
+    if (!origin_is_allowed(req)) {
+        res.status = 403;
+        res.set_content("{\"error\":\"Forbidden origin\"}", "application/json");
+        return;
+    }
     res.set_header("Access-Control-Allow-Origin", "*");
 
     std::string session_id = req.get_header_value("Mcp-Session-Id");
