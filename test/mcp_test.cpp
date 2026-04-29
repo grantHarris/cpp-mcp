@@ -171,6 +171,15 @@ TEST(MessageFormat, ResponseFromJsonNoResult) {
 // Tool Builder Tests
 // ===========================================================================
 
+TEST(ProtocolVersion, ConstantsExposed) {
+    EXPECT_STREQ(mcp::LATEST_MCP_VERSION, "2025-11-25");
+    EXPECT_TRUE(mcp::is_supported_version("2025-11-25"));
+    EXPECT_TRUE(mcp::is_supported_version("2025-06-18"));
+    EXPECT_TRUE(mcp::is_supported_version("2025-03-26"));
+    EXPECT_FALSE(mcp::is_supported_version("2024-11-05"));
+    EXPECT_FALSE(mcp::is_supported_version(""));
+}
+
 TEST(ToolBuilder, BasicTool) {
     auto t = tool_builder("echo")
         .with_description("Echoes input back")
