@@ -623,12 +623,40 @@ TEST_F(ServerTest, ToolCall) {
     EXPECT_EQ(content[0]["text"], "hello");
 }
 
-TEST_F(ServerTest, ToolCallNotFound) {
+// Spec 2025-11-25 (SEP-1303): tools/call validation errors are returned as
+// CallToolResult with isError:true, not as JSON-RPC -32602 protocol errors,
+// so the model can self-correct on the next attempt.
+
+TEST_F(ServerTest, ToolCallUnknownReturnsToolError) {
     auto [sid, _] = mcp_initialize(*cli_);
     json req = {{"jsonrpc", "2.0"}, {"id", 5}, {"method", "tools/call"},
                 {"params", {{"name", "nonexistent"}}}};
     auto res = mcp_post(*cli_, "/mcp", req, sid);
-    EXPECT_TRUE(res["_body"].contains("error"));
+    ASSERT_EQ(res["_status"], 200);
+    ASSERT_TRUE(res["_body"].contains("result"));
+    EXPECT_FALSE(res["_body"].contains("error"));
+    EXPECT_EQ(res["_body"]["result"]["isError"], true);
+    EXPECT_EQ(res["_body"]["result"]["content"][0]["type"], "text");
+}
+
+TEST_F(ServerTest, ToolCallMissingNameReturnsToolError) {
+    auto [sid, _] = mcp_initialize(*cli_);
+    json req = {{"jsonrpc", "2.0"}, {"id", 5}, {"method", "tools/call"},
+                {"params", json::object()}};
+    auto res = mcp_post(*cli_, "/mcp", req, sid);
+    ASSERT_EQ(res["_status"], 200);
+    ASSERT_TRUE(res["_body"].contains("result"));
+    EXPECT_EQ(res["_body"]["result"]["isError"], true);
+}
+
+TEST_F(ServerTest, ToolCallBadJsonStringArgsReturnsToolError) {
+    auto [sid, _] = mcp_initialize(*cli_);
+    json req = {{"jsonrpc", "2.0"}, {"id", 5}, {"method", "tools/call"},
+                {"params", {{"name", "echo"}, {"arguments", "{not valid json"}}}};
+    auto res = mcp_post(*cli_, "/mcp", req, sid);
+    ASSERT_EQ(res["_status"], 200);
+    ASSERT_TRUE(res["_body"].contains("result"));
+    EXPECT_EQ(res["_body"]["result"]["isError"], true);
 }
 
 // ===========================================================================

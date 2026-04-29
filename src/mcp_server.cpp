@@ -521,42 +521,47 @@ void server::register_tool(const tool& tool, tool_handler handler) {
     
     if (method_handlers_.find("tools/call") == method_handlers_.end()) {
         method_handlers_["tools/call"] = [this](const json& params, const std::string& session_id) -> json {
-            if (!params.contains("name")) {
-                throw mcp_exception(error_code::invalid_params, "Missing 'name' parameter");
+            // Spec 2025-11-25 (SEP-1303): tool input-validation failures are
+            // returned as CallToolResult{ isError: true, ... }, not as
+            // JSON-RPC -32602 protocol errors, so the model can self-correct.
+            auto tool_error = [](const std::string& msg) {
+                return json{
+                    {"isError", true},
+                    {"content", json::array({
+                        {{"type", "text"}, {"text", msg}}
+                    })}
+                };
+            };
+
+            if (!params.contains("name") || !params["name"].is_string()) {
+                return tool_error("Missing or invalid 'name' parameter");
             }
-            
+
             std::string tool_name = params["name"];
             auto it = tools_.find(tool_name);
             if (it == tools_.end()) {
-                throw mcp_exception(error_code::invalid_params, "Tool not found: " + tool_name);
+                return tool_error("Tool not found: " + tool_name);
             }
-            
-            json tool_args = params.contains("arguments") ? params["arguments"] : json::array();
+
+            json tool_args = params.contains("arguments") ? params["arguments"] : json::object();
 
             if (tool_args.is_string()) {
                 try {
                     tool_args = json::parse(tool_args.get<std::string>());
                 } catch (const json::exception& e) {
-                    throw mcp_exception(error_code::invalid_params, "Invalid JSON arguments: " + std::string(e.what()));
+                    return tool_error("Invalid JSON arguments: " + std::string(e.what()));
                 }
             }
 
-            json tool_result = {
-                {"isError", false}
-            };
-
+            json tool_result = {{"isError", false}};
             try {
                 tool_result["content"] = it->second.second(tool_args, session_id);
             } catch (const std::exception& e) {
                 tool_result["isError"] = true;
                 tool_result["content"] = json::array({
-                    {
-                        {"type", "text"},
-                        {"text", e.what()}
-                    }
+                    {{"type", "text"}, {"text", e.what()}}
                 });
             }
-
             return tool_result;
         };
     }
