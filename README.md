@@ -12,6 +12,7 @@
 - **Logging**: Structured log delivery to clients with per-session severity filtering
 - **Progress & Cancellation**: Progress notifications for long-running operations and request cancellation
 - **Session Management**: Configurable session limits, inactive session timeout, and SSE keepalive
+- **Public HTTP Hardening**: Bearer-token authorization hook, Origin allowlisting, bounded request bodies, bounded queues, and sanitized error responses
 - **Pagination**: Cursor-based pagination for `tools/list`, `resources/list`, and `prompts/list`
 - **SSL/TLS**: Optional OpenSSL support for HTTPS servers and clients
 
@@ -116,7 +117,10 @@ conf.host = "0.0.0.0";
 conf.port = 8080;
 conf.max_sessions = 20;        // Override default
 conf.session_timeout = 60;     // 60s idle timeout
-conf.allowed_origins = {"http://localhost:3000"};  // empty = no Origin check
+conf.allowed_origins = {"http://localhost:3000"};  // exact Origin allowlist
+conf.max_request_body_size = 1024 * 1024;
+conf.max_queued_tasks = 1024;
+conf.max_queued_http_requests = 128;
 
 mcp::server srv(conf);
 srv.set_server_info("My Server", "1.0.0");
@@ -127,6 +131,29 @@ srv.set_capabilities({
     {"logging", json::object()}
 });
 ```
+
+### Public HTTP Deployment
+
+For browser or internet-reachable deployments, put the server behind HTTPS and configure a bearer-token validator. The library enforces `Authorization: Bearer <token>` on all HTTP transport requests when an auth handler is present; token issuance, refresh, scopes, and revocation remain application responsibilities.
+
+```cpp
+mcp::server::configuration conf;
+conf.host = "0.0.0.0";
+conf.port = 8080;
+conf.allowed_origins = {"https://app.example.com"};
+conf.enable_legacy_sse_transport = false;
+conf.expose_error_details = false;
+conf.max_request_body_size = 1024 * 1024;
+conf.max_queued_tasks = 1024;
+conf.max_queued_http_requests = 128;
+
+mcp::server srv(conf);
+srv.set_auth_handler([](const std::string& token, const std::string& session_id) {
+    return validate_access_token(token, "maestro-mcp", session_id);
+});
+```
+
+`allowed_origins` is exact-match DNS rebinding protection. Leave it empty only for loopback, embedded, or otherwise trusted network deployments where permissive CORS is intentional.
 
 ### Registering Tools
 

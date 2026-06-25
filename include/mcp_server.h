@@ -282,6 +282,9 @@ public:
 
         unsigned int threadpool_size{ std::thread::hardware_concurrency() };
 
+        /** Maximum queued MCP handler tasks (0 = unlimited) */
+        size_t max_queued_tasks{ 1024 };
+
         /**
          * Number of worker threads in cpp-httplib's task queue. Each active
          * SSE stream parks ONE httplib worker for its entire lifetime
@@ -294,6 +297,12 @@ public:
          * generous headroom on top of max_sessions.
          */
         unsigned int http_thread_pool_size{ 64 };
+
+        /** Maximum queued HTTP requests in cpp-httplib's task queue (0 = unlimited) */
+        size_t max_queued_http_requests{ 128 };
+
+        /** Maximum HTTP request body size in bytes (0 = cpp-httplib default/unlimited) */
+        size_t max_request_body_size{ 1024 * 1024 };
 
         /** Maximum concurrent sessions (0 = unlimited) */
         unsigned int max_sessions{ MCP_MAX_SESSIONS };
@@ -308,6 +317,12 @@ public:
          * embedded deployments. Add e.g. "http://localhost:3000".
          */
         std::vector<std::string> allowed_origins;
+
+        /** Enable the deprecated 2024-11-05 HTTP+SSE transport endpoints */
+        bool enable_legacy_sse_transport{ true };
+
+        /** Include exception details in protocol errors. Keep false for untrusted clients. */
+        bool expose_error_details{ false };
 
         #ifdef MCP_SSL        
         /**
@@ -446,8 +461,9 @@ public:
     /**
      * @brief Set authentication handler
      * @param handler Function that takes a token and returns true if valid
-     * @note The handler should return true if the token is valid, otherwise false
-     * @note Not used in the current implementation
+     * @note The handler should return true if the token is valid for the
+     *       optional session ID, otherwise false. If a handler is configured,
+     *       all HTTP transport requests require Authorization: Bearer <token>.
      */
     void set_auth_handler(auth_handler handler);
 
@@ -608,6 +624,16 @@ private:
     // Origin allowlist (empty = no Origin check)
     std::vector<std::string> allowed_origins_;
 
+    // Enable deprecated legacy HTTP+SSE endpoints
+    bool enable_legacy_sse_transport_ = true;
+
+    // Whether to expose exception details to clients
+    bool expose_error_details_ = false;
+
+    // Request/body and queue limits
+    size_t max_request_body_size_ = 1024 * 1024;
+    size_t max_queued_http_requests_ = 128;
+
     // Number of httplib worker threads (set on http_server_->new_task_queue
     // before listen()).
     unsigned int http_thread_pool_size_ = 64;
@@ -632,6 +658,17 @@ private:
     // is configured, or the header is absent — which non-browser clients
     // typically omit).
     bool origin_is_allowed(const httplib::Request& req) const;
+
+    // Set CORS response headers for an already-accepted request.
+    void set_cors_headers(const httplib::Request& req,
+                          httplib::Response& res,
+                          const std::string& methods) const;
+
+    // Authorize a request if an auth handler is configured.
+    bool request_is_authorized(const httplib::Request& req,
+                               const std::string& session_id,
+                               std::string* bearer_token = nullptr) const;
+    void reject_unauthorized(httplib::Response& res) const;
 
     // Parse a single JSON-RPC message from JSON
     request parse_jsonrpc_message(const json& j) const;
@@ -680,7 +717,12 @@ private:
     // Cancelled request tracking (session_id -> set of request IDs)
     std::map<std::string, std::set<std::string>> cancelled_requests_;
 
+    // Session auth binding (session_id -> bearer token)
+    std::map<std::string, std::string> session_auth_tokens_;
+
     // Session management and maintenance
+    void start_maintenance_thread();
+    void stop_maintenance_thread();
     void check_inactive_sessions();
 
     std::mutex maintenance_mutex_;

@@ -24,7 +24,13 @@ public:
      * @brief Constructor
      * @param num_threads Number of threads in the thread pool
      */
-    explicit thread_pool(unsigned int num_threads = std::thread::hardware_concurrency()) : stop_(false) {
+    explicit thread_pool(unsigned int num_threads = std::thread::hardware_concurrency(),
+                         size_t max_queued_tasks = 0)
+        : max_queued_tasks_(max_queued_tasks), stop_(false) {
+        if (num_threads == 0) {
+            num_threads = 1;
+        }
+
         for (unsigned int i = 0; i < num_threads; ++i) {
             workers_.emplace_back([this] {
                 while (true) {
@@ -90,6 +96,10 @@ public:
             if (stop_) {
                 throw std::runtime_error("Thread pool stopped, cannot add task");
             }
+
+            if (max_queued_tasks_ > 0 && tasks_.size() >= max_queued_tasks_) {
+                throw std::runtime_error("Thread pool queue full");
+            }
             
             tasks_.emplace([task]() { (*task)(); });
         }
@@ -104,6 +114,9 @@ private:
     
     // Task queue
     std::queue<std::function<void()>> tasks_;
+
+    // Maximum queued tasks before enqueue rejects (0 = unlimited)
+    size_t max_queued_tasks_ = 0;
     
     // Mutex and condition variable
     std::mutex queue_mutex_;
@@ -115,4 +128,4 @@ private:
 
 } // namespace mcp
 
-#endif // MCP_THREAD_POOL_H 
+#endif // MCP_THREAD_POOL_H
