@@ -7,11 +7,14 @@
  */
 
 #include "mcp_server.h"
+#include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <iomanip>
 #include <random>
+#include <regex>
 #include <sys/stat.h>
 
 namespace {
@@ -54,10 +57,124 @@ void set_jsonrpc_error(httplib::Response& res,
                     "application/json");
 }
 
+std::string quoted_auth_parameter(const std::string& value) {
+    std::string escaped;
+    escaped.reserve(value.size() + 2);
+    escaped.push_back('"');
+    for (char c : value) {
+        if (c == '\r' || c == '\n') {
+            continue;
+        }
+        if (c == '\\' || c == '"') {
+            escaped.push_back('\\');
+        }
+        escaped.push_back(c);
+    }
+    escaped.push_back('"');
+    return escaped;
+}
+
+std::string mcp_exception_message(const mcp::mcp_exception& exception,
+                                  bool expose_error_details,
+                                  const std::string& fallback) {
+    if (exception.code() == mcp::error_code::internal_error &&
+        !expose_error_details) {
+        return fallback;
+    }
+    return exception.what();
+}
+
 bool validate_schema_type(const mcp::json& schema,
                           const mcp::json& value,
                           const std::string& path,
                           std::string& error);
+
+size_t utf8_code_point_count(const std::string& value) {
+    size_t count = 0;
+    for (unsigned char c : value) {
+        if ((c & 0xc0) != 0x80) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+bool schema_type_matches(const std::string& type, const mcp::json& value) {
+    if (type == "object") return value.is_object();
+    if (type == "array") return value.is_array();
+    if (type == "string") return value.is_string();
+    if (type == "number") return value.is_number();
+    if (type == "integer") {
+        return value.is_number_integer() || value.is_number_unsigned();
+    }
+    if (type == "boolean") return value.is_boolean();
+    if (type == "null") return value.is_null();
+    return false;
+}
+
+bool validate_schema_combinators(const mcp::json& schema,
+                                 const mcp::json& value,
+                                 const std::string& path,
+                                 std::string& error) {
+    if (schema.contains("allOf")) {
+        if (!schema["allOf"].is_array()) {
+            error = path + " has invalid allOf schema";
+            return false;
+        }
+        for (const auto& subschema : schema["allOf"]) {
+            if (!validate_schema_type(subschema, value, path, error)) {
+                return false;
+            }
+        }
+    }
+
+    if (schema.contains("anyOf")) {
+        if (!schema["anyOf"].is_array() || schema["anyOf"].empty()) {
+            error = path + " has invalid anyOf schema";
+            return false;
+        }
+        bool matched = false;
+        for (const auto& subschema : schema["anyOf"]) {
+            std::string ignored;
+            if (validate_schema_type(subschema, value, path, ignored)) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            error = path + " must match at least one anyOf schema";
+            return false;
+        }
+    }
+
+    if (schema.contains("oneOf")) {
+        if (!schema["oneOf"].is_array() || schema["oneOf"].empty()) {
+            error = path + " has invalid oneOf schema";
+            return false;
+        }
+        size_t matches = 0;
+        for (const auto& subschema : schema["oneOf"]) {
+            std::string ignored;
+            if (validate_schema_type(subschema, value, path, ignored)) {
+                ++matches;
+            }
+        }
+        if (matches != 1) {
+            error = path + " must match exactly one oneOf schema";
+            return false;
+        }
+    }
+
+    if (schema.contains("not")) {
+        std::string ignored;
+        if (validate_schema_type(schema["not"], value, path, ignored)) {
+            error = path + " matches a forbidden schema";
+            return false;
+        }
+    }
+
+    return true;
+}
 
 bool validate_object_schema(const mcp::json& schema,
                             const mcp::json& value,
@@ -68,10 +185,26 @@ bool validate_object_schema(const mcp::json& schema,
         return false;
     }
 
-    if (schema.contains("required") && schema["required"].is_array()) {
+    if (schema.contains("minProperties") && schema["minProperties"].is_number_unsigned() &&
+        value.size() < schema["minProperties"].get<size_t>()) {
+        error = path + " has too few properties";
+        return false;
+    }
+    if (schema.contains("maxProperties") && schema["maxProperties"].is_number_unsigned() &&
+        value.size() > schema["maxProperties"].get<size_t>()) {
+        error = path + " has too many properties";
+        return false;
+    }
+
+    if (schema.contains("required") && !schema["required"].is_array()) {
+        error = path + " has invalid required schema";
+        return false;
+    }
+    if (schema.contains("required")) {
         for (const auto& required : schema["required"]) {
             if (!required.is_string()) {
-                continue;
+                error = path + " has non-string required property";
+                return false;
             }
             const auto key = required.get<std::string>();
             if (!value.contains(key)) {
@@ -81,7 +214,11 @@ bool validate_object_schema(const mcp::json& schema,
         }
     }
 
-    if (schema.contains("properties") && schema["properties"].is_object()) {
+    if (schema.contains("properties") && !schema["properties"].is_object()) {
+        error = path + " has invalid properties schema";
+        return false;
+    }
+    if (schema.contains("properties")) {
         const auto& properties = schema["properties"];
         for (const auto& [key, property_schema] : properties.items()) {
             if (!value.contains(key)) {
@@ -93,14 +230,24 @@ bool validate_object_schema(const mcp::json& schema,
         }
     }
 
-    if (schema.contains("additionalProperties") &&
-        schema["additionalProperties"].is_boolean() &&
-        !schema["additionalProperties"].get<bool>() &&
-        schema.contains("properties") &&
-        schema["properties"].is_object()) {
-        for (const auto& [key, ignored] : value.items()) {
-            if (!schema["properties"].contains(key)) {
+    if (schema.contains("additionalProperties")) {
+        const auto& additional = schema["additionalProperties"];
+        if (!additional.is_boolean() && !additional.is_object()) {
+            error = path + " has invalid additionalProperties schema";
+            return false;
+        }
+        for (const auto& [key, item] : value.items()) {
+            const bool declared = schema.contains("properties") &&
+                                  schema["properties"].contains(key);
+            if (declared) {
+                continue;
+            }
+            if (additional.is_boolean() && !additional.get<bool>()) {
                 error = "Unexpected parameter '" + key + "'";
+                return false;
+            }
+            if (additional.is_object() &&
+                !validate_schema_type(additional, item, path + "." + key, error)) {
                 return false;
             }
         }
@@ -113,20 +260,115 @@ bool validate_schema_type(const mcp::json& schema,
                           const mcp::json& value,
                           const std::string& path,
                           std::string& error) {
-    if (!schema.is_object() || !schema.contains("type") || !schema["type"].is_string()) {
-        return true;
+    if (schema.is_boolean()) {
+        if (schema.get<bool>()) {
+            return true;
+        }
+        error = path + " is not allowed";
+        return false;
+    }
+    if (!schema.is_object()) {
+        error = path + " has an invalid JSON Schema";
+        return false;
     }
 
-    const auto type = schema["type"].get<std::string>();
-    if (type == "object") {
-        return validate_object_schema(schema, value, path, error);
-    }
-    if (type == "array") {
-        if (!value.is_array()) {
-            error = path + " must be an array";
+    static const std::array<const char*, 13> unsupported_keywords = {
+        "$ref", "$dynamicRef", "contains", "dependentSchemas", "else", "if",
+        "maxContains", "minContains", "patternProperties", "prefixItems",
+        "propertyNames", "then", "unevaluatedProperties"
+    };
+    for (const char* keyword : unsupported_keywords) {
+        if (schema.contains(keyword)) {
+            error = path + " uses unsupported JSON Schema keyword '" + keyword + "'";
             return false;
         }
-        if (schema.contains("items") && schema["items"].is_object()) {
+    }
+
+    if (schema.contains("const") && value != schema["const"]) {
+        error = path + " must equal the schema's const value";
+        return false;
+    }
+    if (schema.contains("enum")) {
+        if (!schema["enum"].is_array() || schema["enum"].empty()) {
+            error = path + " has invalid enum schema";
+            return false;
+        }
+        bool matched = false;
+        for (const auto& candidate : schema["enum"]) {
+            if (candidate == value) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            error = path + " must be one of the allowed values";
+            return false;
+        }
+    }
+
+    if (!validate_schema_combinators(schema, value, path, error)) {
+        return false;
+    }
+
+    if (schema.contains("type")) {
+        bool matched = false;
+        if (schema["type"].is_string()) {
+            const auto expected_type = schema["type"].get<std::string>();
+            matched = schema_type_matches(expected_type, value);
+            if (!matched) {
+                error = path + " must be of type '" + expected_type + "'";
+                return false;
+            }
+        } else if (schema["type"].is_array()) {
+            for (const auto& type : schema["type"]) {
+                if (!type.is_string()) {
+                    error = path + " has invalid type schema";
+                    return false;
+                }
+                if (schema_type_matches(type.get<std::string>(), value)) {
+                    matched = true;
+                }
+            }
+        } else {
+            error = path + " has invalid type schema";
+            return false;
+        }
+        if (!matched) {
+            error = path + " has the wrong type";
+            return false;
+        }
+    }
+
+    if (value.is_object()) {
+        return validate_object_schema(schema, value, path, error);
+    }
+
+    if (value.is_array()) {
+        if (schema.contains("minItems") && schema["minItems"].is_number_unsigned() &&
+            value.size() < schema["minItems"].get<size_t>()) {
+            error = path + " has too few items";
+            return false;
+        }
+        if (schema.contains("maxItems") && schema["maxItems"].is_number_unsigned() &&
+            value.size() > schema["maxItems"].get<size_t>()) {
+            error = path + " has too many items";
+            return false;
+        }
+        if (schema.contains("uniqueItems") && !schema["uniqueItems"].is_boolean()) {
+            error = path + " has invalid uniqueItems schema";
+            return false;
+        }
+        if (schema.value("uniqueItems", false)) {
+            for (size_t i = 0; i < value.size(); ++i) {
+                for (size_t j = i + 1; j < value.size(); ++j) {
+                    if (value[i] == value[j]) {
+                        error = path + " must contain unique items";
+                        return false;
+                    }
+                }
+            }
+        }
+        if (schema.contains("items")) {
             for (size_t i = 0; i < value.size(); ++i) {
                 if (!validate_schema_type(schema["items"], value[i],
                                           path + "[" + std::to_string(i) + "]", error)) {
@@ -136,22 +378,71 @@ bool validate_schema_type(const mcp::json& schema,
         }
         return true;
     }
-    if (type == "string" && !value.is_string()) {
-        error = path + " must be a string";
-        return false;
+
+    if (value.is_string()) {
+        const auto string_value = value.get<std::string>();
+        const size_t length = utf8_code_point_count(string_value);
+        if (schema.contains("minLength") && schema["minLength"].is_number_unsigned() &&
+            length < schema["minLength"].get<size_t>()) {
+            error = path + " is too short";
+            return false;
+        }
+        if (schema.contains("maxLength") && schema["maxLength"].is_number_unsigned() &&
+            length > schema["maxLength"].get<size_t>()) {
+            error = path + " is too long";
+            return false;
+        }
+        if (schema.contains("pattern")) {
+            if (!schema["pattern"].is_string()) {
+                error = path + " has invalid pattern schema";
+                return false;
+            }
+            try {
+                const std::regex pattern(schema["pattern"].get<std::string>());
+                if (!std::regex_search(string_value, pattern)) {
+                    error = path + " does not match the required pattern";
+                    return false;
+                }
+            } catch (const std::regex_error&) {
+                error = path + " has invalid pattern schema";
+                return false;
+            }
+        }
+        return true;
     }
-    if (type == "number" && !value.is_number()) {
-        error = path + " must be a number";
-        return false;
+
+    if (value.is_number()) {
+        const double number = value.get<double>();
+        if (schema.contains("minimum") && schema["minimum"].is_number() &&
+            number < schema["minimum"].get<double>()) {
+            error = path + " is below the minimum";
+            return false;
+        }
+        if (schema.contains("maximum") && schema["maximum"].is_number() &&
+            number > schema["maximum"].get<double>()) {
+            error = path + " is above the maximum";
+            return false;
+        }
+        if (schema.contains("exclusiveMinimum") && schema["exclusiveMinimum"].is_number() &&
+            number <= schema["exclusiveMinimum"].get<double>()) {
+            error = path + " must be greater than the exclusive minimum";
+            return false;
+        }
+        if (schema.contains("exclusiveMaximum") && schema["exclusiveMaximum"].is_number() &&
+            number >= schema["exclusiveMaximum"].get<double>()) {
+            error = path + " must be less than the exclusive maximum";
+            return false;
+        }
+        if (schema.contains("multipleOf") && schema["multipleOf"].is_number()) {
+            const double divisor = schema["multipleOf"].get<double>();
+            if (divisor <= 0.0 ||
+                std::abs(std::remainder(number, divisor)) > 1e-9 * std::max(1.0, std::abs(number))) {
+                error = path + " must be a multiple of the configured value";
+                return false;
+            }
+        }
     }
-    if (type == "integer" && !value.is_number_integer() && !value.is_number_unsigned()) {
-        error = path + " must be an integer";
-        return false;
-    }
-    if (type == "boolean" && !value.is_boolean()) {
-        error = path + " must be a boolean";
-        return false;
-    }
+
     return true;
 }
 
@@ -179,6 +470,7 @@ server::server(const server::configuration& conf)
     , allowed_origins_(conf.allowed_origins)
     , enable_legacy_sse_transport_(conf.enable_legacy_sse_transport)
     , expose_error_details_(conf.expose_error_details)
+    , auth_resource_metadata_url_(conf.auth_resource_metadata_url)
     , max_request_body_size_(conf.max_request_body_size)
     , max_queued_http_requests_(conf.max_queued_http_requests)
     , http_thread_pool_size_(conf.http_thread_pool_size > 0 ? conf.http_thread_pool_size : 64)
@@ -359,7 +651,6 @@ void server::stop() {
         session_protocol_versions_.clear();
         session_log_levels_.clear();
         cancelled_requests_.clear();
-        session_auth_tokens_.clear();
     }
 
     // Close all copied dispatchers so any threads waiting in wait_event()
@@ -722,7 +1013,9 @@ void server::register_tool(const tool& tool, tool_handler handler) {
             } catch (const mcp_exception& e) {
                 tool_result["isError"] = true;
                 tool_result["content"] = json::array({
-                    {{"type", "text"}, {"text", e.what()}}
+                    {{"type", "text"},
+                     {"text", mcp_exception_message(e, expose_error_details_,
+                                                    "Tool execution failed")}}
                 });
             } catch (const std::exception& e) {
                 LOG_ERROR("Tool handler exception for ", tool_name, ": ", e.what());
@@ -808,7 +1101,14 @@ std::vector<tool> server::get_tools() const {
 
 void server::set_auth_handler(auth_handler handler) {
     std::lock_guard<std::mutex> lock(mutex_);
-    auth_handler_ = handler;
+    auth_handler_ = std::move(handler);
+    detailed_auth_handler_ = {};
+}
+
+void server::set_detailed_auth_handler(detailed_auth_handler handler) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    detailed_auth_handler_ = std::move(handler);
+    auth_handler_ = {};
 }
 
 void server::handle_sse(const httplib::Request& req, httplib::Response& res) {
@@ -819,9 +1119,9 @@ void server::handle_sse(const httplib::Request& req, httplib::Response& res) {
     }
     set_cors_headers(req, res, "GET, OPTIONS");
 
-    std::string bearer_token;
-    if (!request_is_authorized(req, "", &bearer_token)) {
-        reject_unauthorized(res);
+    const auto authorization = authorize_request(req, "");
+    if (authorization.status != auth_status::authorized) {
+        reject_authorization(res, authorization);
         return;
     }
 
@@ -854,9 +1154,6 @@ void server::handle_sse(const httplib::Request& req, httplib::Response& res) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         session_dispatchers_[session_id] = session_dispatcher;
-        if (!bearer_token.empty()) {
-            session_auth_tokens_[session_id] = bearer_token;
-        }
     }
     
     // Create session thread
@@ -962,14 +1259,15 @@ void server::handle_jsonrpc(const httplib::Request& req, httplib::Response& res)
     auto sid_it = req.params.find("session_id");
     std::string session_id = sid_it != req.params.end() ? sid_it->second : "";
 
-    if (!request_is_authorized(req, session_id)) {
-        reject_unauthorized(res);
-        return;
-    }
-
     // Setup response headers
     res.set_header("Content-Type", "application/json");
     set_cors_headers(req, res, "POST, OPTIONS");
+
+    const auto authorization = authorize_request(req, session_id);
+    if (authorization.status != auth_status::authorized) {
+        reject_authorization(res, authorization);
+        return;
+    }
 
     // Handle OPTIONS request (CORS pre-flight)
     if (req.method == "OPTIONS") {
@@ -1122,61 +1420,69 @@ void server::set_cors_headers(const httplib::Request& req,
     res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id, MCP-Protocol-Version");
 }
 
-bool server::request_is_authorized(const httplib::Request& req,
-                                   const std::string& session_id,
-                                   std::string* bearer_token) const {
+auth_result server::authorize_request(const httplib::Request& req,
+                                      const std::string& session_id) const {
     auth_handler handler;
+    detailed_auth_handler detailed_handler;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         handler = auth_handler_;
+        detailed_handler = detailed_auth_handler_;
     }
 
-    if (!handler) {
-        return true;
+    if (!handler && !detailed_handler) {
+        return auth_result::allow();
     }
 
     const std::string auth = req.get_header_value("Authorization");
     constexpr const char* bearer_prefix = "Bearer ";
     if (!starts_with_case_insensitive(auth, bearer_prefix)) {
-        return false;
+        return {auth_status::unauthorized, "", ""};
     }
 
     std::string token = auth.substr(std::string(bearer_prefix).size());
     if (token.empty()) {
-        return false;
+        return {auth_status::unauthorized, "", ""};
     }
 
     try {
+        if (detailed_handler) {
+            return detailed_handler(token, session_id);
+        }
         if (!handler(token, session_id)) {
-            return false;
+            return auth_result::reject();
         }
     } catch (const std::exception& e) {
         LOG_WARNING("Auth handler rejected request with exception: ", e.what());
-        return false;
+        return auth_result::reject();
     } catch (...) {
         LOG_WARNING("Auth handler rejected request with unknown exception");
-        return false;
+        return auth_result::reject();
     }
 
-    if (!session_id.empty()) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = session_auth_tokens_.find(session_id);
-        if (it != session_auth_tokens_.end() && it->second != token) {
-            return false;
-        }
-    }
-
-    if (bearer_token) {
-        *bearer_token = std::move(token);
-    }
-    return true;
+    return auth_result::allow();
 }
 
-void server::reject_unauthorized(httplib::Response& res) const {
-    res.status = 401;
-    res.set_header("WWW-Authenticate", "Bearer");
+void server::reject_authorization(httplib::Response& res,
+                                  const auth_result& result) const {
+    const bool forbidden = result.status == auth_status::forbidden;
+    res.status = forbidden ? 403 : 401;
+
+    std::string challenge = "Bearer";
+    if (!result.error.empty()) {
+        challenge += " error=" + quoted_auth_parameter(result.error);
+    }
+    if (!result.scope.empty()) {
+        challenge += " scope=" + quoted_auth_parameter(result.scope);
+    }
+    if (!auth_resource_metadata_url_.empty()) {
+        challenge += " resource_metadata=" +
+                     quoted_auth_parameter(auth_resource_metadata_url_);
+    }
+    res.set_header("WWW-Authenticate", challenge);
     res.set_content(
-        response::create_error(nullptr, error_code::invalid_request, "Unauthorized")
+        response::create_error(nullptr, error_code::invalid_request,
+                               forbidden ? "Forbidden" : "Unauthorized")
             .to_json().dump(),
         "application/json");
 }
@@ -1250,9 +1556,9 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
     // Get or create session
     std::string session_id = req.get_header_value("Mcp-Session-Id");
 
-    std::string bearer_token;
-    if (!request_is_authorized(req, session_id, &bearer_token)) {
-        reject_unauthorized(res);
+    const auto authorization = authorize_request(req, session_id);
+    if (authorization.status != auth_status::authorized) {
+        reject_authorization(res, authorization);
         return;
     }
 
@@ -1306,14 +1612,17 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
             res.set_content("{\"error\":\"Missing Mcp-Session-Id header\"}", "application/json");
             return;
         }
+        std::shared_ptr<event_dispatcher> dispatcher;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (session_dispatchers_.find(session_id) == session_dispatchers_.end()) {
+            auto dispatcher_it = session_dispatchers_.find(session_id);
+            if (dispatcher_it == session_dispatchers_.end()) {
                 // Session expired or invalid — client must re-initialize
                 res.status = 404;
                 res.set_content("{\"error\":\"Session not found\"}", "application/json");
                 return;
             }
+            dispatcher = dispatcher_it->second;
         }
         auto [vstatus, vmsg] = validate_protocol_version_header(req, session_id);
         if (vstatus != 200) {
@@ -1324,6 +1633,7 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
                 "application/json");
             return;
         }
+        dispatcher->update_activity();
     }
 
     // JSON-RPC responses sent by clients are accepted and ignored.
@@ -1342,8 +1652,7 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
     try {
         mcp_req = parse_jsonrpc_message(body);
     } catch (const mcp_exception& e) {
-        int status = (e.code() == error_code::invalid_params) ? 400 : 400;
-        set_jsonrpc_error(res, status, request_id_or_null(body), e.code(), e.what());
+        set_jsonrpc_error(res, 400, request_id_or_null(body), e.code(), e.what());
         return;
     } catch (const std::exception& e) {
         LOG_WARNING("Invalid JSON-RPC request: ", e.what());
@@ -1383,9 +1692,6 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
         {
             std::lock_guard<std::mutex> lock(mutex_);
             session_dispatchers_[session_id] = session_dispatcher;
-            if (!bearer_token.empty()) {
-                session_auth_tokens_[session_id] = bearer_token;
-            }
         }
 
         json result = handle_initialize(mcp_req, session_id);
@@ -1417,8 +1723,9 @@ void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res)
     set_cors_headers(req, res, "GET, OPTIONS");
 
     std::string session_id = req.get_header_value("Mcp-Session-Id");
-    if (!request_is_authorized(req, session_id)) {
-        reject_unauthorized(res);
+    const auto authorization = authorize_request(req, session_id);
+    if (authorization.status != auth_status::authorized) {
+        reject_authorization(res, authorization);
         return;
     }
 
@@ -1508,8 +1815,9 @@ void server::handle_mcp_delete(const httplib::Request& req, httplib::Response& r
     set_cors_headers(req, res, "DELETE, OPTIONS");
 
     std::string session_id = req.get_header_value("Mcp-Session-Id");
-    if (!request_is_authorized(req, session_id)) {
-        reject_unauthorized(res);
+    const auto authorization = authorize_request(req, session_id);
+    if (authorization.status != auth_status::authorized) {
+        reject_authorization(res, authorization);
         return;
     }
 
@@ -1652,7 +1960,7 @@ json server::process_request(const request& req, const std::string& session_id) 
         return response::create_error(
             req.id,
             e.code(),
-            e.what()
+            mcp_exception_message(e, expose_error_details_, "Internal error")
         ).to_json();
     } catch (const std::exception& e) {
         // Other exceptions
@@ -1973,10 +2281,12 @@ void server::start_maintenance_thread() {
 
     maintenance_thread_run_ = true;
     maintenance_thread_ = std::make_unique<std::thread>([this]() {
+        const auto check_interval =
+            std::chrono::seconds(std::min(session_timeout_, 10u));
         while (true) {
-            // Check inactive sessions every 10 seconds
+            // Check at least once per configured timeout, capped at 10 seconds.
             std::unique_lock<std::mutex> lock(maintenance_mutex_);
-            auto should_exit = maintenance_cond_.wait_for(lock, std::chrono::seconds(10), [this] {
+            auto should_exit = maintenance_cond_.wait_for(lock, check_interval, [this] {
                 return !maintenance_thread_run_;
             });
             if (should_exit) {
@@ -2068,8 +2378,6 @@ void server::close_session(const std::string& session_id) {
         session_protocol_versions_.erase(session_id);
         session_log_levels_.erase(session_id);
         cancelled_requests_.erase(session_id);
-        session_auth_tokens_.erase(session_id);
-
         // Copy cleanup handlers so we can invoke them without holding the lock.
         cleanup_handlers_copy = session_cleanup_handler_;
     }

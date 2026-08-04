@@ -23,6 +23,7 @@ public:
     /**
      * @brief Constructor
      * @param num_threads Number of threads in the thread pool
+     * @param max_queued_tasks Maximum queued tasks (0 = unlimited)
      */
     explicit thread_pool(unsigned int num_threads = std::thread::hardware_concurrency(),
                          size_t max_queued_tasks = 0)

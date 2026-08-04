@@ -585,12 +585,16 @@ struct AuthServer {
     std::unique_ptr<httplib::Client> cli;
     int port;
 
-    explicit AuthServer(auth_handler handler) {
+    explicit AuthServer(auth_handler handler,
+                        std::vector<std::string> allowed_origins = {},
+                        std::string resource_metadata_url = {}) {
         port = next_port();
         server::configuration conf;
         conf.host = "127.0.0.1";
         conf.port = port;
         conf.name = "AuthServer";
+        conf.allowed_origins = std::move(allowed_origins);
+        conf.auth_resource_metadata_url = std::move(resource_metadata_url);
         srv = std::make_unique<server>(conf);
         srv->set_auth_handler(std::move(handler));
         srv->start(false);
@@ -647,7 +651,7 @@ TEST(Authentication, ValidBearerTokenAuthorizesSessionRequests) {
     EXPECT_EQ(ok["_body"]["result"], json::object());
 }
 
-TEST(Authentication, SessionIsBoundToInitialBearerToken) {
+TEST(Authentication, RefreshedBearerTokenAuthorizesExistingSession) {
     AuthServer s([](const std::string& token, const std::string&) {
         return token == "good" || token == "other";
     });
@@ -658,11 +662,61 @@ TEST(Authentication, SessionIsBoundToInitialBearerToken) {
     json ping = {{"jsonrpc", "2.0"}, {"id", 2}, {"method", "ping"}};
     auto switched = mcp_post(*s.cli, "/mcp", ping, sid,
                              {{"Authorization", "Bearer other"}});
-    EXPECT_EQ(switched["_status"], 401);
+    EXPECT_EQ(switched["_status"], 200);
 
     auto original = mcp_post(*s.cli, "/mcp", ping, sid,
                              {{"Authorization", "Bearer good"}});
     EXPECT_EQ(original["_status"], 200);
+}
+
+TEST(Authentication, LegacyFailureIncludesCorsHeaders) {
+    AuthServer s([](const std::string& token, const std::string&) {
+        return token == "good";
+    }, {"https://app.example.com"});
+
+    httplib::Headers headers = {
+        {"Origin", "https://app.example.com"},
+        {"Content-Type", "application/json"}
+    };
+    auto response = s.cli->Post("/message?session_id=missing", headers, "{}",
+                                "application/json");
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->status, 401);
+    EXPECT_EQ(response->get_header_value("Access-Control-Allow-Origin"),
+              "https://app.example.com");
+    EXPECT_EQ(response->get_header_value("WWW-Authenticate"), "Bearer");
+}
+
+TEST(Authentication, DetailedHandlerReturnsScopeChallenge) {
+    int port = next_port();
+    server::configuration conf;
+    conf.host = "127.0.0.1";
+    conf.port = port;
+    conf.auth_resource_metadata_url =
+        "https://mcp.example.com/.well-known/oauth-protected-resource";
+    server srv(conf);
+    srv.set_detailed_auth_handler([](const std::string&, const std::string&) {
+        return auth_result::insufficient_scope("files:read");
+    });
+    srv.start(false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    httplib::Client cli("127.0.0.1", port);
+    json init = {{"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"},
+                 {"params", {{"protocolVersion", LATEST_MCP_VERSION},
+                             {"clientInfo", {{"name", "t"}, {"version", "0"}}},
+                             {"capabilities", json::object()}}}};
+    httplib::Headers headers = {{"Authorization", "Bearer narrow"}};
+    auto response = cli.Post("/mcp", headers, init.dump(), "application/json");
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->status, 403);
+    const auto challenge = response->get_header_value("WWW-Authenticate");
+    EXPECT_NE(challenge.find("error=\"insufficient_scope\""), std::string::npos);
+    EXPECT_NE(challenge.find("scope=\"files:read\""), std::string::npos);
+    EXPECT_NE(challenge.find("resource_metadata=\"https://mcp.example.com/"),
+              std::string::npos);
+
+    srv.stop();
 }
 
 TEST(RequestLimits, RejectsOversizedRequestBody) {
@@ -685,6 +739,39 @@ TEST(RequestLimits, RejectsOversizedRequestBody) {
     EXPECT_EQ(resp->status, 413);
 
     srv.stop();
+}
+
+TEST(SessionTimeout, ActivePostOnlySessionStaysAliveInBlockingMode) {
+    int port = next_port();
+    server::configuration conf;
+    conf.host = "127.0.0.1";
+    conf.port = port;
+    conf.session_timeout = 1;
+    server srv(conf);
+    std::thread server_thread([&] { srv.start(true); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    httplib::Client cli("127.0.0.1", port);
+    cli.set_connection_timeout(2);
+    cli.set_read_timeout(2);
+    auto [sid, _] = mcp_initialize(cli);
+
+    int last_status = 0;
+    if (sid.empty()) {
+        ADD_FAILURE() << "Failed to initialize blocking-mode server";
+    } else {
+        for (int i = 0; i < 8; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            json ping = {{"jsonrpc", "2.0"}, {"id", i + 2}, {"method", "ping"}};
+            auto response = mcp_post(cli, "/mcp", ping, sid);
+            last_status = response.value("_status", 0);
+            EXPECT_EQ(last_status, 200);
+        }
+    }
+
+    srv.stop();
+    server_thread.join();
+    EXPECT_EQ(last_status, 200);
 }
 
 // Spec 2025-06-18 removed JSON-RPC batching. Servers MUST reject array bodies.
@@ -846,6 +933,112 @@ TEST_F(ServerTest, ToolCallWrongSchemaTypeReturnsToolError) {
     EXPECT_EQ(res["_body"]["result"]["isError"], true);
     EXPECT_NE(res["_body"]["result"]["content"][0]["text"].get<std::string>().find("string"),
               std::string::npos);
+}
+
+TEST_F(ServerTest, ToolCallEnforcesCommonJsonSchemaConstraints) {
+    tool constrained;
+    constrained.name = "constrained";
+    constrained.description = "Constrained input";
+    constrained.parameters_schema = {
+        {"type", "object"},
+        {"properties", {
+            {"mode", {{"type", "string"}, {"enum", {"safe", "fast"}}}},
+            {"count", {{"type", "integer"}, {"minimum", 1}, {"maximum", 3}}},
+            {"code", {{"type", "string"}, {"pattern", "^[A-Z]{2}$"}}}
+        }},
+        {"required", {"mode", "count", "code"}},
+        {"additionalProperties", false}
+    };
+
+    std::atomic<int> calls{0};
+    srv_->register_tool(constrained,
+        [&calls](const json&, const std::string&) -> json {
+            ++calls;
+            return json::array({{{"type", "text"}, {"text", "ok"}}});
+        });
+
+    auto [sid, _] = mcp_initialize(*cli_);
+    auto call = [&](const json& arguments, int id) {
+        json request = {{"jsonrpc", "2.0"}, {"id", id}, {"method", "tools/call"},
+                        {"params", {{"name", "constrained"},
+                                    {"arguments", arguments}}}};
+        return mcp_post(*cli_, "/mcp", request, sid);
+    };
+
+    auto bad_enum = call({{"mode", "admin"}, {"count", 2}, {"code", "AB"}}, 60);
+    EXPECT_TRUE(bad_enum["_body"]["result"]["isError"]);
+
+    auto bad_range = call({{"mode", "safe"}, {"count", 9}, {"code", "AB"}}, 61);
+    EXPECT_TRUE(bad_range["_body"]["result"]["isError"]);
+
+    auto bad_pattern = call({{"mode", "safe"}, {"count", 2}, {"code", "bad"}}, 62);
+    EXPECT_TRUE(bad_pattern["_body"]["result"]["isError"]);
+
+    auto extra = call({{"mode", "safe"}, {"count", 2}, {"code", "AB"},
+                       {"unexpected", true}}, 63);
+    EXPECT_TRUE(extra["_body"]["result"]["isError"]);
+    EXPECT_EQ(calls.load(), 0);
+
+    auto valid = call({{"mode", "safe"}, {"count", 2}, {"code", "AB"}}, 64);
+    EXPECT_FALSE(valid["_body"]["result"]["isError"]);
+    EXPECT_EQ(calls.load(), 1);
+}
+
+TEST_F(ServerTest, UnsupportedToolSchemaKeywordFailsClosed) {
+    tool referenced;
+    referenced.name = "referenced";
+    referenced.description = "Unsupported schema";
+    referenced.parameters_schema = {
+        {"type", "object"},
+        {"properties", {{"value", {{"$ref", "#/$defs/value"}}}}},
+        {"$defs", {{"value", {{"type", "string"}}}}}
+    };
+
+    std::atomic<bool> called{false};
+    srv_->register_tool(referenced,
+        [&called](const json&, const std::string&) -> json {
+            called = true;
+            return json::array();
+        });
+
+    auto [sid, _] = mcp_initialize(*cli_);
+    json request = {{"jsonrpc", "2.0"}, {"id", 65}, {"method", "tools/call"},
+                    {"params", {{"name", "referenced"},
+                                {"arguments", {{"value", "x"}}}}}};
+    auto response = mcp_post(*cli_, "/mcp", request, sid);
+    EXPECT_TRUE(response["_body"]["result"]["isError"]);
+    EXPECT_NE(response["_body"]["result"]["content"][0]["text"]
+                  .get<std::string>().find("unsupported"),
+              std::string::npos);
+    EXPECT_FALSE(called.load());
+}
+
+TEST_F(ServerTest, InternalMcpExceptionDetailsAreSanitized) {
+    srv_->register_method("secret/fail",
+        [](const json&, const std::string&) -> json {
+            throw mcp_exception(error_code::internal_error,
+                                "database password is hunter2");
+        });
+
+    auto secret_tool = tool_builder("secret_tool").with_description("fails").build();
+    srv_->register_tool(secret_tool,
+        [](const json&, const std::string&) -> json {
+            throw mcp_exception(error_code::internal_error,
+                                "private tool implementation detail");
+        });
+
+    auto [sid, _] = mcp_initialize(*cli_);
+    json method_request = {{"jsonrpc", "2.0"}, {"id", 66},
+                           {"method", "secret/fail"}};
+    auto method_response = mcp_post(*cli_, "/mcp", method_request, sid);
+    EXPECT_EQ(method_response["_body"]["error"]["message"], "Internal error");
+
+    json tool_request = {{"jsonrpc", "2.0"}, {"id", 67}, {"method", "tools/call"},
+                         {"params", {{"name", "secret_tool"},
+                                     {"arguments", json::object()}}}};
+    auto tool_response = mcp_post(*cli_, "/mcp", tool_request, sid);
+    EXPECT_EQ(tool_response["_body"]["result"]["content"][0]["text"],
+              "Tool execution failed");
 }
 
 // ===========================================================================

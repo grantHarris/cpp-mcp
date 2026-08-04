@@ -32,6 +32,7 @@
 #include <atomic>
 #include <deque>
 #include <optional>
+#include <utility>
 
 
 namespace mcp {
@@ -40,6 +41,33 @@ using method_handler = std::function<json(const json&, const std::string&)>;
 using tool_handler = method_handler;
 using notification_handler = std::function<void(const json&, const std::string&)>;
 using auth_handler = std::function<bool(const std::string&, const std::string&)>;
+
+enum class auth_status {
+    authorized,
+    unauthorized,
+    forbidden
+};
+
+struct auth_result {
+    auth_status status{auth_status::unauthorized};
+    std::string error;
+    std::string scope;
+
+    static auth_result allow() {
+        return {auth_status::authorized, "", ""};
+    }
+
+    static auth_result reject(std::string error = "invalid_token") {
+        return {auth_status::unauthorized, std::move(error), ""};
+    }
+
+    static auth_result insufficient_scope(std::string required_scope) {
+        return {auth_status::forbidden, "insufficient_scope", std::move(required_scope)};
+    }
+};
+
+using detailed_auth_handler =
+    std::function<auth_result(const std::string&, const std::string&)>;
 using session_cleanup_handler = std::function<void(const std::string&)>;
 
 /**
@@ -301,7 +329,7 @@ public:
         /** Maximum queued HTTP requests in cpp-httplib's task queue (0 = unlimited) */
         size_t max_queued_http_requests{ 128 };
 
-        /** Maximum HTTP request body size in bytes (0 = cpp-httplib default/unlimited) */
+        /** Maximum HTTP request body size in bytes (0 = cpp-httplib compiled default) */
         size_t max_request_body_size{ 1024 * 1024 };
 
         /** Maximum concurrent sessions (0 = unlimited) */
@@ -323,6 +351,12 @@ public:
 
         /** Include exception details in protocol errors. Keep false for untrusted clients. */
         bool expose_error_details{ false };
+
+        /**
+         * RFC 9728 protected-resource metadata URL advertised in Bearer
+         * challenges. The application or reverse proxy must serve this URL.
+         */
+        std::string auth_resource_metadata_url;
 
         #ifdef MCP_SSL        
         /**
@@ -460,12 +494,22 @@ public:
     
     /**
      * @brief Set authentication handler
-     * @param handler Function that takes a token and returns true if valid
+     * @param handler Function that takes a token and optional session ID and
+     *        returns true if the token is authorized
      * @note The handler should return true if the token is valid for the
      *       optional session ID, otherwise false. If a handler is configured,
      *       all HTTP transport requests require Authorization: Bearer <token>.
+     *       Session-to-principal binding belongs in this callback so refreshed
+     *       access tokens can remain valid for an existing session.
      */
     void set_auth_handler(auth_handler handler);
+
+    /**
+     * @brief Set an authentication handler capable of returning 401 or 403
+     *        authorization results and required scopes
+     * @param handler Function that validates a token for the optional session ID
+     */
+    void set_detailed_auth_handler(detailed_auth_handler handler);
 
     /**
      * @brief Send a request (or notification) to a client
@@ -596,6 +640,7 @@ private:
 
     // Authentication handler
     auth_handler auth_handler_;
+    detailed_auth_handler detailed_auth_handler_;
 
     // Per-session log level (session_id -> level string, default "warning")
     std::map<std::string, std::string> session_log_levels_;
@@ -629,6 +674,9 @@ private:
 
     // Whether to expose exception details to clients
     bool expose_error_details_ = false;
+
+    // RFC 9728 protected-resource metadata URL for Bearer challenges
+    std::string auth_resource_metadata_url_;
 
     // Request/body and queue limits
     size_t max_request_body_size_ = 1024 * 1024;
@@ -665,10 +713,10 @@ private:
                           const std::string& methods) const;
 
     // Authorize a request if an auth handler is configured.
-    bool request_is_authorized(const httplib::Request& req,
-                               const std::string& session_id,
-                               std::string* bearer_token = nullptr) const;
-    void reject_unauthorized(httplib::Response& res) const;
+    auth_result authorize_request(const httplib::Request& req,
+                                  const std::string& session_id) const;
+    void reject_authorization(httplib::Response& res,
+                              const auth_result& result) const;
 
     // Parse a single JSON-RPC message from JSON
     request parse_jsonrpc_message(const json& j) const;
@@ -716,9 +764,6 @@ private:
 
     // Cancelled request tracking (session_id -> set of request IDs)
     std::map<std::string, std::set<std::string>> cancelled_requests_;
-
-    // Session auth binding (session_id -> bearer token)
-    std::map<std::string, std::string> session_auth_tokens_;
 
     // Session management and maintenance
     void start_maintenance_thread();

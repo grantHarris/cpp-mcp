@@ -6,7 +6,7 @@
 
 - **JSON-RPC 2.0 Communication**: Request/response communication based on JSON-RPC 2.0 standard
 - **Dual Transport**: Streamable HTTP (`POST/GET/DELETE /mcp`) and legacy HTTP+SSE transports
-- **Tools**: Register and call tools with JSON Schema parameter validation
+- **Tools**: Register and call tools with fail-closed validation for common JSON Schema constraints
 - **Resources**: Static resources, file resources, and URI template-based dynamic resources
 - **Prompts**: Server-defined prompt templates with typed arguments
 - **Logging**: Structured log delivery to clients with per-session severity filtering
@@ -143,17 +143,42 @@ conf.port = 8080;
 conf.allowed_origins = {"https://app.example.com"};
 conf.enable_legacy_sse_transport = false;
 conf.expose_error_details = false;
+conf.auth_resource_metadata_url =
+    "https://mcp.example.com/.well-known/oauth-protected-resource";
 conf.max_request_body_size = 1024 * 1024;
 conf.max_queued_tasks = 1024;
 conf.max_queued_http_requests = 128;
 
 mcp::server srv(conf);
 srv.set_auth_handler([](const std::string& token, const std::string& session_id) {
-    return validate_access_token(token, "maestro-mcp", session_id);
+    return validate_access_token(token, "example-mcp", session_id);
 });
 ```
 
+The application or reverse proxy must serve the RFC 9728 protected-resource metadata URL. Use `set_detailed_auth_handler()` when authorization needs to distinguish an invalid token from insufficient scopes:
+
+```cpp
+srv.set_detailed_auth_handler(
+    [](const std::string& token, const std::string& session_id) {
+        auto principal = validate_access_token(token, "example-mcp");
+        if (!principal) return mcp::auth_result::reject();
+        if (!principal->has_scope("files:read")) {
+            return mcp::auth_result::insufficient_scope("files:read");
+        }
+        if (!authorize_session_principal(session_id, principal->subject)) {
+            return mcp::auth_result::reject();
+        }
+        return mcp::auth_result::allow();
+    });
+```
+
+Bind sessions to a stable principal in the handler rather than to the literal access-token string; this allows short-lived access tokens to rotate without forcing a new MCP session.
+
 `allowed_origins` is exact-match DNS rebinding protection. Leave it empty only for loopback, embedded, or otherwise trusted network deployments where permissive CORS is intentional.
+
+`max_queued_http_requests` bounds memory during overload. cpp-httplib closes newly accepted sockets once this queue is full, so clients may observe a connection reset rather than an HTTP 503 response. Set it to `0` only when an upstream proxy provides a suitable connection/backpressure limit.
+
+Tool argument validation covers types (including unions and `null`), `required`, `properties`, `additionalProperties`, `enum`, `const`, numeric and length bounds, patterns, array constraints, and `allOf`/`anyOf`/`oneOf`/`not`. Schemas using unsupported advanced keywords such as `$ref`, conditional schemas, `contains`, or `unevaluatedProperties` fail closed with a tool error. Applications needing full JSON Schema 2020-12 support should validate with a dedicated schema library in the tool handler.
 
 ### Registering Tools
 
