@@ -7,12 +7,449 @@
  */
 
 #include "mcp_server.h"
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <cmath>
+#include <cstdlib>
+#include <iomanip>
+#include <random>
+#include <regex>
 #include <sys/stat.h>
 
 namespace {
 bool file_exists(const std::string& path) {
     struct stat st;
     return ::stat(path.c_str(), &st) == 0;
+}
+
+bool starts_with_case_insensitive(const std::string& value, const std::string& prefix) {
+    if (value.size() < prefix.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < prefix.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(value[i])) !=
+            std::tolower(static_cast<unsigned char>(prefix[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool is_valid_jsonrpc_id(const mcp::json& id) {
+    return id.is_null() || id.is_string() || id.is_number_integer() || id.is_number_unsigned();
+}
+
+mcp::json request_id_or_null(const mcp::json& message) {
+    if (message.is_object() && message.contains("id") && is_valid_jsonrpc_id(message["id"])) {
+        return message["id"];
+    }
+    return nullptr;
+}
+
+void set_jsonrpc_error(httplib::Response& res,
+                       int status,
+                       const mcp::json& id,
+                       mcp::error_code code,
+                       const std::string& message) {
+    res.status = status;
+    res.set_content(mcp::response::create_error(id, code, message).to_json().dump(),
+                    "application/json");
+}
+
+std::string quoted_auth_parameter(const std::string& value) {
+    std::string escaped;
+    escaped.reserve(value.size() + 2);
+    escaped.push_back('"');
+    for (char c : value) {
+        if (c == '\r' || c == '\n') {
+            continue;
+        }
+        if (c == '\\' || c == '"') {
+            escaped.push_back('\\');
+        }
+        escaped.push_back(c);
+    }
+    escaped.push_back('"');
+    return escaped;
+}
+
+std::string mcp_exception_message(const mcp::mcp_exception& exception,
+                                  bool expose_error_details,
+                                  const std::string& fallback) {
+    if (exception.code() == mcp::error_code::internal_error &&
+        !expose_error_details) {
+        return fallback;
+    }
+    return exception.what();
+}
+
+bool validate_schema_type(const mcp::json& schema,
+                          const mcp::json& value,
+                          const std::string& path,
+                          std::string& error);
+
+size_t utf8_code_point_count(const std::string& value) {
+    size_t count = 0;
+    for (unsigned char c : value) {
+        if ((c & 0xc0) != 0x80) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+bool schema_type_matches(const std::string& type, const mcp::json& value) {
+    if (type == "object") return value.is_object();
+    if (type == "array") return value.is_array();
+    if (type == "string") return value.is_string();
+    if (type == "number") return value.is_number();
+    if (type == "integer") {
+        return value.is_number_integer() || value.is_number_unsigned();
+    }
+    if (type == "boolean") return value.is_boolean();
+    if (type == "null") return value.is_null();
+    return false;
+}
+
+bool validate_schema_combinators(const mcp::json& schema,
+                                 const mcp::json& value,
+                                 const std::string& path,
+                                 std::string& error) {
+    if (schema.contains("allOf")) {
+        if (!schema["allOf"].is_array()) {
+            error = path + " has invalid allOf schema";
+            return false;
+        }
+        for (const auto& subschema : schema["allOf"]) {
+            if (!validate_schema_type(subschema, value, path, error)) {
+                return false;
+            }
+        }
+    }
+
+    if (schema.contains("anyOf")) {
+        if (!schema["anyOf"].is_array() || schema["anyOf"].empty()) {
+            error = path + " has invalid anyOf schema";
+            return false;
+        }
+        bool matched = false;
+        for (const auto& subschema : schema["anyOf"]) {
+            std::string ignored;
+            if (validate_schema_type(subschema, value, path, ignored)) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            error = path + " must match at least one anyOf schema";
+            return false;
+        }
+    }
+
+    if (schema.contains("oneOf")) {
+        if (!schema["oneOf"].is_array() || schema["oneOf"].empty()) {
+            error = path + " has invalid oneOf schema";
+            return false;
+        }
+        size_t matches = 0;
+        for (const auto& subschema : schema["oneOf"]) {
+            std::string ignored;
+            if (validate_schema_type(subschema, value, path, ignored)) {
+                ++matches;
+            }
+        }
+        if (matches != 1) {
+            error = path + " must match exactly one oneOf schema";
+            return false;
+        }
+    }
+
+    if (schema.contains("not")) {
+        std::string ignored;
+        if (validate_schema_type(schema["not"], value, path, ignored)) {
+            error = path + " matches a forbidden schema";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool validate_object_schema(const mcp::json& schema,
+                            const mcp::json& value,
+                            const std::string& path,
+                            std::string& error) {
+    if (!value.is_object()) {
+        error = path + " must be an object";
+        return false;
+    }
+
+    if (schema.contains("minProperties") && schema["minProperties"].is_number_unsigned() &&
+        value.size() < schema["minProperties"].get<size_t>()) {
+        error = path + " has too few properties";
+        return false;
+    }
+    if (schema.contains("maxProperties") && schema["maxProperties"].is_number_unsigned() &&
+        value.size() > schema["maxProperties"].get<size_t>()) {
+        error = path + " has too many properties";
+        return false;
+    }
+
+    if (schema.contains("required") && !schema["required"].is_array()) {
+        error = path + " has invalid required schema";
+        return false;
+    }
+    if (schema.contains("required")) {
+        for (const auto& required : schema["required"]) {
+            if (!required.is_string()) {
+                error = path + " has non-string required property";
+                return false;
+            }
+            const auto key = required.get<std::string>();
+            if (!value.contains(key)) {
+                error = "Missing required parameter '" + key + "'";
+                return false;
+            }
+        }
+    }
+
+    if (schema.contains("properties") && !schema["properties"].is_object()) {
+        error = path + " has invalid properties schema";
+        return false;
+    }
+    if (schema.contains("properties")) {
+        const auto& properties = schema["properties"];
+        for (const auto& [key, property_schema] : properties.items()) {
+            if (!value.contains(key)) {
+                continue;
+            }
+            if (!validate_schema_type(property_schema, value[key], path + "." + key, error)) {
+                return false;
+            }
+        }
+    }
+
+    if (schema.contains("additionalProperties")) {
+        const auto& additional = schema["additionalProperties"];
+        if (!additional.is_boolean() && !additional.is_object()) {
+            error = path + " has invalid additionalProperties schema";
+            return false;
+        }
+        for (const auto& [key, item] : value.items()) {
+            const bool declared = schema.contains("properties") &&
+                                  schema["properties"].contains(key);
+            if (declared) {
+                continue;
+            }
+            if (additional.is_boolean() && !additional.get<bool>()) {
+                error = "Unexpected parameter '" + key + "'";
+                return false;
+            }
+            if (additional.is_object() &&
+                !validate_schema_type(additional, item, path + "." + key, error)) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+bool validate_schema_type(const mcp::json& schema,
+                          const mcp::json& value,
+                          const std::string& path,
+                          std::string& error) {
+    if (schema.is_boolean()) {
+        if (schema.get<bool>()) {
+            return true;
+        }
+        error = path + " is not allowed";
+        return false;
+    }
+    if (!schema.is_object()) {
+        error = path + " has an invalid JSON Schema";
+        return false;
+    }
+
+    static const std::array<const char*, 13> unsupported_keywords = {
+        "$ref", "$dynamicRef", "contains", "dependentSchemas", "else", "if",
+        "maxContains", "minContains", "patternProperties", "prefixItems",
+        "propertyNames", "then", "unevaluatedProperties"
+    };
+    for (const char* keyword : unsupported_keywords) {
+        if (schema.contains(keyword)) {
+            error = path + " uses unsupported JSON Schema keyword '" + keyword + "'";
+            return false;
+        }
+    }
+
+    if (schema.contains("const") && value != schema["const"]) {
+        error = path + " must equal the schema's const value";
+        return false;
+    }
+    if (schema.contains("enum")) {
+        if (!schema["enum"].is_array() || schema["enum"].empty()) {
+            error = path + " has invalid enum schema";
+            return false;
+        }
+        bool matched = false;
+        for (const auto& candidate : schema["enum"]) {
+            if (candidate == value) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            error = path + " must be one of the allowed values";
+            return false;
+        }
+    }
+
+    if (!validate_schema_combinators(schema, value, path, error)) {
+        return false;
+    }
+
+    if (schema.contains("type")) {
+        bool matched = false;
+        if (schema["type"].is_string()) {
+            const auto expected_type = schema["type"].get<std::string>();
+            matched = schema_type_matches(expected_type, value);
+            if (!matched) {
+                error = path + " must be of type '" + expected_type + "'";
+                return false;
+            }
+        } else if (schema["type"].is_array()) {
+            for (const auto& type : schema["type"]) {
+                if (!type.is_string()) {
+                    error = path + " has invalid type schema";
+                    return false;
+                }
+                if (schema_type_matches(type.get<std::string>(), value)) {
+                    matched = true;
+                }
+            }
+        } else {
+            error = path + " has invalid type schema";
+            return false;
+        }
+        if (!matched) {
+            error = path + " has the wrong type";
+            return false;
+        }
+    }
+
+    if (value.is_object()) {
+        return validate_object_schema(schema, value, path, error);
+    }
+
+    if (value.is_array()) {
+        if (schema.contains("minItems") && schema["minItems"].is_number_unsigned() &&
+            value.size() < schema["minItems"].get<size_t>()) {
+            error = path + " has too few items";
+            return false;
+        }
+        if (schema.contains("maxItems") && schema["maxItems"].is_number_unsigned() &&
+            value.size() > schema["maxItems"].get<size_t>()) {
+            error = path + " has too many items";
+            return false;
+        }
+        if (schema.contains("uniqueItems") && !schema["uniqueItems"].is_boolean()) {
+            error = path + " has invalid uniqueItems schema";
+            return false;
+        }
+        if (schema.value("uniqueItems", false)) {
+            for (size_t i = 0; i < value.size(); ++i) {
+                for (size_t j = i + 1; j < value.size(); ++j) {
+                    if (value[i] == value[j]) {
+                        error = path + " must contain unique items";
+                        return false;
+                    }
+                }
+            }
+        }
+        if (schema.contains("items")) {
+            for (size_t i = 0; i < value.size(); ++i) {
+                if (!validate_schema_type(schema["items"], value[i],
+                                          path + "[" + std::to_string(i) + "]", error)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    if (value.is_string()) {
+        const auto string_value = value.get<std::string>();
+        const size_t length = utf8_code_point_count(string_value);
+        if (schema.contains("minLength") && schema["minLength"].is_number_unsigned() &&
+            length < schema["minLength"].get<size_t>()) {
+            error = path + " is too short";
+            return false;
+        }
+        if (schema.contains("maxLength") && schema["maxLength"].is_number_unsigned() &&
+            length > schema["maxLength"].get<size_t>()) {
+            error = path + " is too long";
+            return false;
+        }
+        if (schema.contains("pattern")) {
+            if (!schema["pattern"].is_string()) {
+                error = path + " has invalid pattern schema";
+                return false;
+            }
+            try {
+                const std::regex pattern(schema["pattern"].get<std::string>());
+                if (!std::regex_search(string_value, pattern)) {
+                    error = path + " does not match the required pattern";
+                    return false;
+                }
+            } catch (const std::regex_error&) {
+                error = path + " has invalid pattern schema";
+                return false;
+            }
+        }
+        return true;
+    }
+
+    if (value.is_number()) {
+        const double number = value.get<double>();
+        if (schema.contains("minimum") && schema["minimum"].is_number() &&
+            number < schema["minimum"].get<double>()) {
+            error = path + " is below the minimum";
+            return false;
+        }
+        if (schema.contains("maximum") && schema["maximum"].is_number() &&
+            number > schema["maximum"].get<double>()) {
+            error = path + " is above the maximum";
+            return false;
+        }
+        if (schema.contains("exclusiveMinimum") && schema["exclusiveMinimum"].is_number() &&
+            number <= schema["exclusiveMinimum"].get<double>()) {
+            error = path + " must be greater than the exclusive minimum";
+            return false;
+        }
+        if (schema.contains("exclusiveMaximum") && schema["exclusiveMaximum"].is_number() &&
+            number >= schema["exclusiveMaximum"].get<double>()) {
+            error = path + " must be less than the exclusive maximum";
+            return false;
+        }
+        if (schema.contains("multipleOf") && schema["multipleOf"].is_number()) {
+            const double divisor = schema["multipleOf"].get<double>();
+            if (divisor <= 0.0 ||
+                std::abs(std::remainder(number, divisor)) > 1e-9 * std::max(1.0, std::abs(number))) {
+                error = path + " must be a multiple of the configured value";
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+bool validate_tool_arguments(const mcp::json& schema,
+                             const mcp::json& args,
+                             std::string& error) {
+    return validate_schema_type(schema, args, "arguments", error);
 }
 } // anonymous namespace
 
@@ -27,10 +464,15 @@ server::server(const server::configuration& conf)
     , sse_endpoint_(conf.sse_endpoint)
     , msg_endpoint_(conf.msg_endpoint)
     , mcp_endpoint_(conf.mcp_endpoint)
-    , thread_pool_(conf.threadpool_size)
+    , thread_pool_(conf.threadpool_size, conf.max_queued_tasks)
     , max_sessions_(conf.max_sessions)
     , session_timeout_(conf.session_timeout)
     , allowed_origins_(conf.allowed_origins)
+    , enable_legacy_sse_transport_(conf.enable_legacy_sse_transport)
+    , expose_error_details_(conf.expose_error_details)
+    , auth_resource_metadata_url_(conf.auth_resource_metadata_url)
+    , max_request_body_size_(conf.max_request_body_size)
+    , max_queued_http_requests_(conf.max_queued_http_requests)
     , http_thread_pool_size_(conf.http_thread_pool_size > 0 ? conf.http_thread_pool_size : 64)
 {
     #ifdef MCP_SSL
@@ -60,9 +502,33 @@ server::server(const server::configuration& conf)
     // same SSE clients depend on. Setting our own pool size decouples the
     // ceiling from hardware_concurrency.
     unsigned int pool_size = http_thread_pool_size_;
-    http_server_->new_task_queue = [pool_size]() {
-        return new httplib::ThreadPool(pool_size);
+    size_t max_queued_http_requests = max_queued_http_requests_;
+    http_server_->new_task_queue = [pool_size, max_queued_http_requests]() {
+        return new httplib::ThreadPool(pool_size, max_queued_http_requests);
     };
+
+    if (max_request_body_size_ > 0) {
+        http_server_->set_payload_max_length(max_request_body_size_);
+    }
+
+    http_server_->set_exception_handler([this](const httplib::Request& req,
+                                               httplib::Response& res,
+                                               std::exception_ptr ep) {
+        try {
+            if (ep) {
+                std::rethrow_exception(ep);
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR("Unhandled HTTP handler exception: ", e.what());
+        } catch (...) {
+            LOG_ERROR("Unhandled unknown HTTP handler exception");
+        }
+
+        if (origin_is_allowed(req)) {
+            set_cors_headers(req, res, "GET, POST, DELETE, OPTIONS");
+        }
+        set_jsonrpc_error(res, 500, nullptr, error_code::internal_error, "Internal error");
+    });
 }
 
 server::~server() {
@@ -78,25 +544,29 @@ bool server::start(bool blocking) {
     LOG_INFO("Starting MCP server on ", host_, ":", port_);
     
     // Setup CORS handling
-    http_server_->Options(".*", [](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-        res.set_header("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id");
-        res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id");
+    http_server_->Options(".*", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!origin_is_allowed(req)) {
+            res.status = 403;
+            res.set_content("{\"error\":\"Forbidden origin\"}", "application/json");
+            return;
+        }
+        set_cors_headers(req, res, "GET, POST, DELETE, OPTIONS");
         res.status = 204; // No Content
     });
 
-    // Setup JSON-RPC endpoint (SSE transport)
-    http_server_->Post(msg_endpoint_.c_str(), [this](const httplib::Request& req, httplib::Response& res) {
-        this->handle_jsonrpc(req, res);
-        LOG_INFO(req.remote_addr, ":", req.remote_port, " - \"POST ", req.path, " HTTP/1.1\" ", res.status);
-    });
+    if (enable_legacy_sse_transport_) {
+        // Setup JSON-RPC endpoint (legacy HTTP+SSE transport)
+        http_server_->Post(msg_endpoint_.c_str(), [this](const httplib::Request& req, httplib::Response& res) {
+            this->handle_jsonrpc(req, res);
+            LOG_INFO(req.remote_addr, ":", req.remote_port, " - \"POST ", req.path, " HTTP/1.1\" ", res.status);
+        });
 
-    // Setup SSE endpoint (legacy 2024-11-05 transport)
-    http_server_->Get(sse_endpoint_.c_str(), [this](const httplib::Request& req, httplib::Response& res) {
-        this->handle_sse(req, res);
-        LOG_INFO(req.remote_addr, ":", req.remote_port, " - \"GET ", req.path, " HTTP/1.1\" ", res.status);
-    });
+        // Setup SSE endpoint (legacy 2024-11-05 transport)
+        http_server_->Get(sse_endpoint_.c_str(), [this](const httplib::Request& req, httplib::Response& res) {
+            this->handle_sse(req, res);
+            LOG_INFO(req.remote_addr, ":", req.remote_port, " - \"GET ", req.path, " HTTP/1.1\" ", res.status);
+        });
+    }
 
     // Streamable HTTP transport (2025-03-26)
     http_server_->Post(mcp_endpoint_.c_str(), [this](const httplib::Request& req, httplib::Response& res) {
@@ -114,32 +584,7 @@ bool server::start(bool blocking) {
         LOG_INFO(req.remote_addr, ":", req.remote_port, " - \"DELETE ", req.path, " HTTP/1.1\" ", res.status);
     });
     
-    // Start resource check thread (only start in non-blocking mode)
-    if (!blocking) {
-        maintenance_thread_run_ = true;
-        maintenance_thread_ = std::make_unique<std::thread>([this]() {
-            while (true) {
-                // Check inactive sessions every 10 seconds
-                std::unique_lock<std::mutex> lock(maintenance_mutex_);
-                auto should_exit = maintenance_cond_.wait_for(lock, std::chrono::seconds(10), [this] {
-                    return !maintenance_thread_run_;
-                });
-                if (should_exit) {
-                    LOG_INFO("Maintenance thread exiting");
-                    return;
-                }
-                lock.unlock();
-
-                try {
-                    check_inactive_sessions();
-                } catch (const std::exception& e) {
-                    LOG_ERROR("Exception in maintenance thread: ", e.what());
-                } catch (...) {
-                    LOG_ERROR("Unknown exception in maintenance thread");
-                }
-            }
-        });
-    }
+    start_maintenance_thread();
     
     // Start server
     if (blocking) {
@@ -147,6 +592,7 @@ bool server::start(bool blocking) {
         LOG_INFO("Starting server in blocking mode");
         if (!http_server_->listen(host_.c_str(), port_)) {
             running_ = false;
+            stop_maintenance_thread();
             LOG_ERROR("Failed to start server on ", host_, ":", port_);
             return false;
         }
@@ -158,6 +604,7 @@ bool server::start(bool blocking) {
             if (!http_server_->listen(host_.c_str(), port_)) {
                 LOG_ERROR("Failed to start server on ", host_, ":", port_);
                 running_ = false;
+                stop_maintenance_thread();
                 return;
             }
         });
@@ -174,21 +621,7 @@ void server::stop() {
     LOG_INFO("Stopping MCP server on ", host_, ":", port_);
     running_ = false;
 
-    // Close maintenance thread
-    if (maintenance_thread_ && maintenance_thread_->joinable()) {
-        {
-            std::unique_lock<std::mutex> lock(maintenance_mutex_);
-            maintenance_thread_run_ = false;
-        }
-
-        maintenance_cond_.notify_one();
-
-        try {
-            maintenance_thread_->join();
-        } catch (...) {
-            maintenance_thread_->detach();
-        }
-    }
+    stop_maintenance_thread();
     
     // Copy all dispatchers and threads to avoid holding the lock for too long
     std::vector<std::shared_ptr<event_dispatcher>> dispatchers_to_close;
@@ -215,6 +648,9 @@ void server::stop() {
         session_dispatchers_.clear();
         sse_threads_.clear();
         session_initialized_.clear();
+        session_protocol_versions_.clear();
+        session_log_levels_.clear();
+        cancelled_requests_.clear();
     }
 
     // Close all copied dispatchers so any threads waiting in wait_event()
@@ -327,8 +763,8 @@ void server::register_resource(const std::string& path, std::shared_ptr<resource
     // Register methods for resource access
     if (method_handlers_.find("resources/read") == method_handlers_.end()) {
         method_handlers_["resources/read"] = [this](const json& params, const std::string& session_id) -> json {
-            if (!params.contains("uri")) {
-                throw mcp_exception(error_code::invalid_params, "Missing 'uri' parameter");
+            if (!params.contains("uri") || !params["uri"].is_string()) {
+                throw mcp_exception(error_code::invalid_params, "Missing or invalid 'uri' parameter");
             }
 
             std::string uri = params["uri"];
@@ -384,8 +820,8 @@ void server::register_resource(const std::string& path, std::shared_ptr<resource
     
     if (method_handlers_.find("resources/subscribe") == method_handlers_.end()) {
         method_handlers_["resources/subscribe"] = [this](const json& params, const std::string& session_id) -> json {
-            if (!params.contains("uri")) {
-                throw mcp_exception(error_code::invalid_params, "Missing 'uri' parameter");
+            if (!params.contains("uri") || !params["uri"].is_string()) {
+                throw mcp_exception(error_code::invalid_params, "Missing or invalid 'uri' parameter");
             }
             
             std::string uri = params["uri"];
@@ -400,8 +836,8 @@ void server::register_resource(const std::string& path, std::shared_ptr<resource
 
     if (method_handlers_.find("resources/unsubscribe") == method_handlers_.end()) {
         method_handlers_["resources/unsubscribe"] = [this](const json& params, const std::string& session_id) -> json {
-            if (!params.contains("uri")) {
-                throw mcp_exception(error_code::invalid_params, "Missing 'uri' parameter");
+            if (!params.contains("uri") || !params["uri"].is_string()) {
+                throw mcp_exception(error_code::invalid_params, "Missing or invalid 'uri' parameter");
             }
             return json::object();
         };
@@ -451,8 +887,8 @@ void server::register_resource_template(
         // Force registration by calling register_resource with a dummy,
         // or just register the read handler directly.
         method_handlers_["resources/read"] = [this](const json& params, const std::string& session_id) -> json {
-            if (!params.contains("uri")) {
-                throw mcp_exception(error_code::invalid_params, "Missing 'uri' parameter");
+            if (!params.contains("uri") || !params["uri"].is_string()) {
+                throw mcp_exception(error_code::invalid_params, "Missing or invalid 'uri' parameter");
             }
             std::string uri = params["uri"];
             auto it = resources_.find(uri);
@@ -566,13 +1002,27 @@ void server::register_tool(const tool& tool, tool_handler handler) {
                 }
             }
 
+            std::string validation_error;
+            if (!validate_tool_arguments(it->second.first.parameters_schema, tool_args, validation_error)) {
+                return tool_error("Invalid tool arguments: " + validation_error);
+            }
+
             json tool_result = {{"isError", false}};
             try {
                 tool_result["content"] = it->second.second(tool_args, session_id);
-            } catch (const std::exception& e) {
+            } catch (const mcp_exception& e) {
                 tool_result["isError"] = true;
                 tool_result["content"] = json::array({
-                    {{"type", "text"}, {"text", e.what()}}
+                    {{"type", "text"},
+                     {"text", mcp_exception_message(e, expose_error_details_,
+                                                    "Tool execution failed")}}
+                });
+            } catch (const std::exception& e) {
+                LOG_ERROR("Tool handler exception for ", tool_name, ": ", e.what());
+                tool_result["isError"] = true;
+                tool_result["content"] = json::array({
+                    {{"type", "text"},
+                     {"text", expose_error_details_ ? e.what() : "Tool execution failed"}}
                 });
             }
             return tool_result;
@@ -611,8 +1061,8 @@ void server::register_prompt(const prompt& prompt, prompt_handler handler) {
 
     if (method_handlers_.find("prompts/get") == method_handlers_.end()) {
         method_handlers_["prompts/get"] = [this](const json& params, const std::string& session_id) -> json {
-            if (!params.contains("name")) {
-                throw mcp_exception(error_code::invalid_params, "Missing 'name' parameter");
+            if (!params.contains("name") || !params["name"].is_string()) {
+                throw mcp_exception(error_code::invalid_params, "Missing or invalid 'name' parameter");
             }
 
             std::string prompt_name = params["name"];
@@ -651,7 +1101,14 @@ std::vector<tool> server::get_tools() const {
 
 void server::set_auth_handler(auth_handler handler) {
     std::lock_guard<std::mutex> lock(mutex_);
-    auth_handler_ = handler;
+    auth_handler_ = std::move(handler);
+    detailed_auth_handler_ = {};
+}
+
+void server::set_detailed_auth_handler(detailed_auth_handler handler) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    detailed_auth_handler_ = std::move(handler);
+    auth_handler_ = {};
 }
 
 void server::handle_sse(const httplib::Request& req, httplib::Response& res) {
@@ -660,6 +1117,14 @@ void server::handle_sse(const httplib::Request& req, httplib::Response& res) {
         res.set_content("{\"error\":\"Forbidden origin\"}", "application/json");
         return;
     }
+    set_cors_headers(req, res, "GET, OPTIONS");
+
+    const auto authorization = authorize_request(req, "");
+    if (authorization.status != auth_status::authorized) {
+        reject_authorization(res, authorization);
+        return;
+    }
+
     // Enforce session limit
     if (max_sessions_ > 0) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -678,7 +1143,6 @@ void server::handle_sse(const httplib::Request& req, httplib::Response& res) {
     res.set_header("Content-Type", "text/event-stream");
     res.set_header("Cache-Control", "no-cache");
     res.set_header("Connection", "keep-alive");
-    res.set_header("Access-Control-Allow-Origin", "*");
     
     // Create session-specific event dispatcher
     auto session_dispatcher = std::make_shared<event_dispatcher>();
@@ -792,21 +1256,24 @@ void server::handle_jsonrpc(const httplib::Request& req, httplib::Response& res)
         res.set_content("{\"error\":\"Forbidden origin\"}", "application/json");
         return;
     }
+    auto sid_it = req.params.find("session_id");
+    std::string session_id = sid_it != req.params.end() ? sid_it->second : "";
+
     // Setup response headers
     res.set_header("Content-Type", "application/json");
-    res.set_header("Access-Control-Allow-Origin", "*");
-    res.set_header("Access-Control-Allow-Methods", "POST, OPTIONS");
-    res.set_header("Access-Control-Allow-Headers", "Content-Type");
+    set_cors_headers(req, res, "POST, OPTIONS");
+
+    const auto authorization = authorize_request(req, session_id);
+    if (authorization.status != auth_status::authorized) {
+        reject_authorization(res, authorization);
+        return;
+    }
 
     // Handle OPTIONS request (CORS pre-flight)
     if (req.method == "OPTIONS") {
         res.status = 204; // No Content
         return;
     }
-    
-    // Get session ID
-    auto it = req.params.find("session_id");
-    std::string session_id = it != req.params.end() ? it->second : "";
 
     // Update session activity time
     if (!session_id.empty()) {
@@ -876,9 +1343,16 @@ void server::handle_jsonrpc(const httplib::Request& req, httplib::Response& res)
     // If it is a notification (no ID), process it directly and return 202 status code
     if (mcp_req.is_notification()) {
         // Process it asynchronously in the thread pool
-        thread_pool_.enqueue([this, mcp_req, session_id]() {
-            process_request(mcp_req, session_id);
-        });
+        try {
+            thread_pool_.enqueue([this, mcp_req, session_id]() {
+                process_request(mcp_req, session_id);
+            });
+        } catch (const std::exception& e) {
+            LOG_WARNING("Failed to enqueue notification: ", e.what());
+            res.status = 503;
+            res.set_content("{\"error\":\"Server busy\"}", "application/json");
+            return;
+        }
         
         // Return 202 Accepted
         res.status = 202;
@@ -887,19 +1361,26 @@ void server::handle_jsonrpc(const httplib::Request& req, httplib::Response& res)
     }
     
     // For requests with ID, process it asynchronously in the thread pool and return the result via SSE
-    thread_pool_.enqueue([this, mcp_req, session_id, dispatcher]() {
-        // Process the request
-        json response_json = process_request(mcp_req, session_id);
-        
-        // Send response via SSE
-        std::stringstream ss;
-        ss << "event: message\r\ndata: " << response_json.dump() << "\r\n\r\n";
-        bool result = dispatcher->send_event(ss.str());
-        
-        if (!result) {
-            LOG_ERROR("Failed to send response via SSE: session_id=", session_id);
-        }
-    });
+    try {
+        thread_pool_.enqueue([this, mcp_req, session_id, dispatcher]() {
+            // Process the request
+            json response_json = process_request(mcp_req, session_id);
+
+            // Send response via SSE
+            std::stringstream ss;
+            ss << "event: message\r\ndata: " << response_json.dump() << "\r\n\r\n";
+            bool result = dispatcher->send_event(ss.str());
+
+            if (!result) {
+                LOG_ERROR("Failed to send response via SSE: session_id=", session_id);
+            }
+        });
+    } catch (const std::exception& e) {
+        LOG_WARNING("Failed to enqueue request: ", e.what());
+        res.status = 503;
+        res.set_content("{\"error\":\"Server busy\"}", "application/json");
+        return;
+    }
     
     // Return 202 Accepted
     res.status = 202;
@@ -920,6 +1401,90 @@ bool server::origin_is_allowed(const httplib::Request& req) const {
     }
     return std::find(allowed_origins_.begin(), allowed_origins_.end(), origin)
            != allowed_origins_.end();
+}
+
+void server::set_cors_headers(const httplib::Request& req,
+                              httplib::Response& res,
+                              const std::string& methods) const {
+    const std::string origin = req.get_header_value("Origin");
+    if (allowed_origins_.empty()) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+    } else if (!origin.empty() && origin_is_allowed(req)) {
+        res.set_header("Access-Control-Allow-Origin", origin);
+        res.set_header("Vary", "Origin");
+    }
+
+    res.set_header("Access-Control-Allow-Methods", methods);
+    res.set_header("Access-Control-Allow-Headers",
+                   "Authorization, Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version");
+    res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id, MCP-Protocol-Version");
+}
+
+auth_result server::authorize_request(const httplib::Request& req,
+                                      const std::string& session_id) const {
+    auth_handler handler;
+    detailed_auth_handler detailed_handler;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        handler = auth_handler_;
+        detailed_handler = detailed_auth_handler_;
+    }
+
+    if (!handler && !detailed_handler) {
+        return auth_result::allow();
+    }
+
+    const std::string auth = req.get_header_value("Authorization");
+    constexpr const char* bearer_prefix = "Bearer ";
+    if (!starts_with_case_insensitive(auth, bearer_prefix)) {
+        return {auth_status::unauthorized, "", ""};
+    }
+
+    std::string token = auth.substr(std::string(bearer_prefix).size());
+    if (token.empty()) {
+        return {auth_status::unauthorized, "", ""};
+    }
+
+    try {
+        if (detailed_handler) {
+            return detailed_handler(token, session_id);
+        }
+        if (!handler(token, session_id)) {
+            return auth_result::reject();
+        }
+    } catch (const std::exception& e) {
+        LOG_WARNING("Auth handler rejected request with exception: ", e.what());
+        return auth_result::reject();
+    } catch (...) {
+        LOG_WARNING("Auth handler rejected request with unknown exception");
+        return auth_result::reject();
+    }
+
+    return auth_result::allow();
+}
+
+void server::reject_authorization(httplib::Response& res,
+                                  const auth_result& result) const {
+    const bool forbidden = result.status == auth_status::forbidden;
+    res.status = forbidden ? 403 : 401;
+
+    std::string challenge = "Bearer";
+    if (!result.error.empty()) {
+        challenge += " error=" + quoted_auth_parameter(result.error);
+    }
+    if (!result.scope.empty()) {
+        challenge += " scope=" + quoted_auth_parameter(result.scope);
+    }
+    if (!auth_resource_metadata_url_.empty()) {
+        challenge += " resource_metadata=" +
+                     quoted_auth_parameter(auth_resource_metadata_url_);
+    }
+    res.set_header("WWW-Authenticate", challenge);
+    res.set_content(
+        response::create_error(nullptr, error_code::invalid_request,
+                               forbidden ? "Forbidden" : "Unauthorized")
+            .to_json().dump(),
+        "application/json");
 }
 
 std::pair<int, std::string>
@@ -943,15 +1508,37 @@ server::validate_protocol_version_header(const httplib::Request& req,
 }
 
 request server::parse_jsonrpc_message(const json& j) const {
+    if (!j.is_object()) {
+        throw mcp_exception(error_code::invalid_request, "JSON-RPC message must be an object");
+    }
+
     request req;
-    req.jsonrpc = j.value("jsonrpc", "2.0");
+    if (!j.contains("jsonrpc") || !j["jsonrpc"].is_string() ||
+        j["jsonrpc"].get<std::string>() != "2.0") {
+        throw mcp_exception(error_code::invalid_request, "Expected jsonrpc to be \"2.0\"");
+    }
+    req.jsonrpc = "2.0";
+
     if (j.contains("id") && !j["id"].is_null()) {
+        if (!is_valid_jsonrpc_id(j["id"])) {
+            throw mcp_exception(error_code::invalid_request,
+                                "JSON-RPC id must be a string, integer, or null");
+        }
         req.id = j["id"];
     }
-    if (j.contains("method")) {
-        req.method = j["method"].get<std::string>();
+
+    if (!j.contains("method") || !j["method"].is_string() ||
+        j["method"].get<std::string>().empty()) {
+        throw mcp_exception(error_code::invalid_request,
+                            "Expected non-empty string for JSON-RPC method");
     }
+    req.method = j["method"].get<std::string>();
+
     if (j.contains("params")) {
+        if (!j["params"].is_object()) {
+            throw mcp_exception(error_code::invalid_params,
+                                "Expected object for JSON-RPC params");
+        }
         req.params = j["params"];
     }
     return req;
@@ -963,17 +1550,21 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
         res.set_content("{\"error\":\"Forbidden origin\"}", "application/json");
         return;
     }
-    // CORS headers
-    res.set_header("Access-Control-Allow-Origin", "*");
-    res.set_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-    res.set_header("Access-Control-Allow-Headers",
-                   "Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version");
-    res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id, MCP-Protocol-Version");
+
+    set_cors_headers(req, res, "GET, POST, DELETE, OPTIONS");
+
+    // Get or create session
+    std::string session_id = req.get_header_value("Mcp-Session-Id");
+
+    const auto authorization = authorize_request(req, session_id);
+    if (authorization.status != auth_status::authorized) {
+        reject_authorization(res, authorization);
+        return;
+    }
 
     // Reflect the protocol version of this exchange on every response.
     {
-        std::string sid = req.get_header_value("Mcp-Session-Id");
-        std::string ver = !sid.empty() ? session_protocol_version(sid) : "";
+        std::string ver = !session_id.empty() ? session_protocol_version(session_id) : "";
         if (ver.empty()) ver = LATEST_MCP_VERSION;
         res.set_header("MCP-Protocol-Version", ver);
     }
@@ -991,24 +1582,16 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
         return;
     }
 
-    // Get or create session
-    std::string session_id = req.get_header_value("Mcp-Session-Id");
+    if (!body.is_object()) {
+        set_jsonrpc_error(res, 400, nullptr, error_code::invalid_request,
+                          "JSON-RPC message must be an object");
+        return;
+    }
 
     // Check if this is an initialize request (no session needed)
     bool is_initialize = false;
-    if (body.is_object() && body.contains("method") && body["method"] == "initialize") {
+    if (body.contains("method") && body["method"].is_string() && body["method"] == "initialize") {
         is_initialize = true;
-    }
-
-    // Spec 2025-06-18 removed JSON-RPC batching; reject array bodies outright.
-    if (body.is_array()) {
-        res.status = 400;
-        res.set_content(
-            response::create_error(nullptr, error_code::invalid_request,
-                                   "JSON-RPC batching is not supported (spec 2025-06-18+)")
-                .to_json().dump(),
-            "application/json");
-        return;
     }
 
     // Reject re-initialization on an existing session
@@ -1029,14 +1612,17 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
             res.set_content("{\"error\":\"Missing Mcp-Session-Id header\"}", "application/json");
             return;
         }
+        std::shared_ptr<event_dispatcher> dispatcher;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (session_dispatchers_.find(session_id) == session_dispatchers_.end()) {
+            auto dispatcher_it = session_dispatchers_.find(session_id);
+            if (dispatcher_it == session_dispatchers_.end()) {
                 // Session expired or invalid — client must re-initialize
                 res.status = 404;
                 res.set_content("{\"error\":\"Session not found\"}", "application/json");
                 return;
             }
+            dispatcher = dispatcher_it->second;
         }
         auto [vstatus, vmsg] = validate_protocol_version_header(req, session_id);
         if (vstatus != 200) {
@@ -1047,13 +1633,38 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
                 "application/json");
             return;
         }
+        dispatcher->update_activity();
     }
 
-    // Notifications and responses (no id, or id=null): fire and forget.
+    // JSON-RPC responses sent by clients are accepted and ignored.
+    if (!body.contains("method") && body.contains("id") &&
+        (body.contains("result") || body.contains("error"))) {
+        if (!session_id.empty()) {
+            res.status = 202;
+            return;
+        }
+        set_jsonrpc_error(res, 400, request_id_or_null(body), error_code::invalid_request,
+                          "Missing Mcp-Session-Id header");
+        return;
+    }
+
+    request mcp_req;
+    try {
+        mcp_req = parse_jsonrpc_message(body);
+    } catch (const mcp_exception& e) {
+        set_jsonrpc_error(res, 400, request_id_or_null(body), e.code(), e.what());
+        return;
+    } catch (const std::exception& e) {
+        LOG_WARNING("Invalid JSON-RPC request: ", e.what());
+        set_jsonrpc_error(res, 400, request_id_or_null(body), error_code::invalid_request,
+                          "Invalid JSON-RPC request");
+        return;
+    }
+
+    // Notifications (no id, or id=null): fire and forget.
     bool has_request_id = body.contains("id") && !body["id"].is_null();
     if (!has_request_id) {
         if (!session_id.empty()) {
-            auto mcp_req = parse_jsonrpc_message(body);
             process_request(mcp_req, session_id);
         }
         res.status = 202;
@@ -1083,7 +1694,6 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
             session_dispatchers_[session_id] = session_dispatcher;
         }
 
-        auto mcp_req = parse_jsonrpc_message(body);
         json result = handle_initialize(mcp_req, session_id);
 
         res.set_header("Mcp-Session-Id", session_id);
@@ -1099,7 +1709,6 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
     }
 
     // Non-initialize request with an id: process synchronously and return inline JSON.
-    auto mcp_req = parse_jsonrpc_message(body);
     json result = process_request(mcp_req, session_id);
     res.set_header("Content-Type", "application/json");
     res.set_content(result.dump(), "application/json");
@@ -1111,13 +1720,15 @@ void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res)
         res.set_content("{\"error\":\"Forbidden origin\"}", "application/json");
         return;
     }
-    // CORS headers
-    res.set_header("Access-Control-Allow-Origin", "*");
-    res.set_header("Access-Control-Allow-Headers",
-                   "Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version");
-    res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id, MCP-Protocol-Version");
+    set_cors_headers(req, res, "GET, OPTIONS");
 
     std::string session_id = req.get_header_value("Mcp-Session-Id");
+    const auto authorization = authorize_request(req, session_id);
+    if (authorization.status != auth_status::authorized) {
+        reject_authorization(res, authorization);
+        return;
+    }
+
     {
         std::string ver = !session_id.empty() ? session_protocol_version(session_id) : "";
         if (ver.empty()) ver = LATEST_MCP_VERSION;
@@ -1201,9 +1812,15 @@ void server::handle_mcp_delete(const httplib::Request& req, httplib::Response& r
         res.set_content("{\"error\":\"Forbidden origin\"}", "application/json");
         return;
     }
-    res.set_header("Access-Control-Allow-Origin", "*");
+    set_cors_headers(req, res, "DELETE, OPTIONS");
 
     std::string session_id = req.get_header_value("Mcp-Session-Id");
+    const auto authorization = authorize_request(req, session_id);
+    if (authorization.status != auth_status::authorized) {
+        reject_authorization(res, authorization);
+        return;
+    }
+
     {
         std::string ver = !session_id.empty() ? session_protocol_version(session_id) : "";
         if (ver.empty()) ver = LATEST_MCP_VERSION;
@@ -1260,7 +1877,13 @@ json server::process_request(const request& req, const std::string& session_id) 
             }
         }
         if (handler) {
-            handler(req.params, session_id);
+            try {
+                handler(req.params, session_id);
+            } catch (const std::exception& e) {
+                LOG_ERROR("Notification handler exception for ", req.method, ": ", e.what());
+            } catch (...) {
+                LOG_ERROR("Unknown notification handler exception for ", req.method);
+            }
         }
 
         return json::object();
@@ -1276,11 +1899,17 @@ json server::process_request(const request& req, const std::string& session_id) 
         } else if (req.method == "ping") {
             return response::create_success(req.id, json::object()).to_json();
         } else if (req.method == "logging/setLevel") {
-            if (!req.params.contains("level")) {
+            if (!req.params.contains("level") || !req.params["level"].is_string()) {
                 return response::create_error(req.id, error_code::invalid_params,
-                    "Missing 'level' parameter").to_json();
+                    "Missing or invalid 'level' parameter").to_json();
             }
             std::string level = req.params["level"].get<std::string>();
+            if (level != "debug" && level != "info" && level != "notice" &&
+                level != "warning" && level != "error" && level != "critical" &&
+                level != "alert" && level != "emergency") {
+                return response::create_error(req.id, error_code::invalid_params,
+                    "Invalid log level").to_json();
+            }
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 session_log_levels_[session_id] = level;
@@ -1331,7 +1960,7 @@ json server::process_request(const request& req, const std::string& session_id) 
         return response::create_error(
             req.id,
             e.code(),
-            e.what()
+            mcp_exception_message(e, expose_error_details_, "Internal error")
         ).to_json();
     } catch (const std::exception& e) {
         // Other exceptions
@@ -1339,7 +1968,7 @@ json server::process_request(const request& req, const std::string& session_id) 
         return response::create_error(
             req.id,
             error_code::internal_error,
-            "Internal error: " + std::string(e.what())
+            expose_error_details_ ? "Internal error: " + std::string(e.what()) : "Internal error"
         ).to_json();
     } catch (...) {
         // Unknown exception
@@ -1614,39 +2243,86 @@ void server::set_session_initialized(const std::string& session_id, bool initial
 }
 
 std::string server::generate_session_id() const {
+    std::array<unsigned char, 16> bytes{};
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    arc4random_buf(bytes.data(), bytes.size());
+#else
     std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(0, 15);
-    
+    for (auto& byte : bytes) {
+        byte = static_cast<unsigned char>(rd() & 0xff);
+    }
+#endif
+
+    // RFC 4122 version 4 UUID bits.
+    bytes[6] = static_cast<unsigned char>((bytes[6] & 0x0f) | 0x40);
+    bytes[8] = static_cast<unsigned char>((bytes[8] & 0x3f) | 0x80);
+
     std::stringstream ss;
-    ss << std::hex;
-    
-    // UUID format: 8-4-4-4-12 hexadecimal digits
-    for (int i = 0; i < 8; ++i) {
-        ss << dis(gen);
+    ss << std::hex << std::setfill('0');
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) {
+            ss << "-";
+        }
+        ss << std::setw(2) << static_cast<int>(bytes[i]);
     }
-    ss << "-";
-    
-    for (int i = 0; i < 4; ++i) {
-        ss << dis(gen);
-    }
-    ss << "-";
-    
-    for (int i = 0; i < 4; ++i) {
-        ss << dis(gen);
-    }
-    ss << "-";
-    
-    for (int i = 0; i < 4; ++i) {
-        ss << dis(gen);
-    }
-    ss << "-";
-    
-    for (int i = 0; i < 12; ++i) {
-        ss << dis(gen);
-    }
-    
+
     return ss.str();
+}
+
+void server::start_maintenance_thread() {
+    if (session_timeout_ == 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(maintenance_mutex_);
+    if (maintenance_thread_run_) {
+        return;
+    }
+
+    maintenance_thread_run_ = true;
+    maintenance_thread_ = std::make_unique<std::thread>([this]() {
+        const auto check_interval =
+            std::chrono::seconds(std::min(session_timeout_, 10u));
+        while (true) {
+            // Check at least once per configured timeout, capped at 10 seconds.
+            std::unique_lock<std::mutex> lock(maintenance_mutex_);
+            auto should_exit = maintenance_cond_.wait_for(lock, check_interval, [this] {
+                return !maintenance_thread_run_;
+            });
+            if (should_exit) {
+                LOG_INFO("Maintenance thread exiting");
+                return;
+            }
+            lock.unlock();
+
+            try {
+                check_inactive_sessions();
+            } catch (const std::exception& e) {
+                LOG_ERROR("Exception in maintenance thread: ", e.what());
+            } catch (...) {
+                LOG_ERROR("Unknown exception in maintenance thread");
+            }
+        }
+    });
+}
+
+void server::stop_maintenance_thread() {
+    std::unique_ptr<std::thread> thread_to_join;
+    {
+        std::lock_guard<std::mutex> lock(maintenance_mutex_);
+        maintenance_thread_run_ = false;
+        thread_to_join = std::move(maintenance_thread_);
+    }
+
+    maintenance_cond_.notify_one();
+
+    if (thread_to_join && thread_to_join->joinable()) {
+        try {
+            thread_to_join->join();
+        } catch (const std::exception& e) {
+            LOG_ERROR("Failed to join maintenance thread: ", e.what());
+        }
+    }
 }
 
 void server::check_inactive_sessions() {
@@ -1702,7 +2378,6 @@ void server::close_session(const std::string& session_id) {
         session_protocol_versions_.erase(session_id);
         session_log_levels_.erase(session_id);
         cancelled_requests_.erase(session_id);
-
         // Copy cleanup handlers so we can invoke them without holding the lock.
         cleanup_handlers_copy = session_cleanup_handler_;
     }
