@@ -984,6 +984,38 @@ TEST_F(ServerTest, ToolCallEnforcesCommonJsonSchemaConstraints) {
     EXPECT_EQ(calls.load(), 1);
 }
 
+TEST_F(ServerTest, NullArgumentsTreatedAsEmptyObject) {
+    tool no_args;
+    no_args.name = "no_args";
+    no_args.description = "Takes no arguments";
+    no_args.parameters_schema = {{"type", "object"}};
+
+    std::atomic<int> calls{0};
+    srv_->register_tool(no_args,
+        [&calls](const json&, const std::string&) -> json {
+            ++calls;
+            return json::array({{{"type", "text"}, {"text", "ok"}}});
+        });
+
+    auto [sid, _] = mcp_initialize(*cli_);
+
+    // "arguments" is optional, so an explicit null means the same as omitting
+    // the key. Clients send it that way routinely for no-argument tools - our
+    // own sse_client does, since a default constructed json is null - and
+    // validating null against {"type":"object"} would reject every such call.
+    json explicit_null = {{"jsonrpc", "2.0"}, {"id", 70}, {"method", "tools/call"},
+                          {"params", {{"name", "no_args"}, {"arguments", nullptr}}}};
+    auto with_null = mcp_post(*cli_, "/mcp", explicit_null, sid);
+    EXPECT_FALSE(with_null["_body"]["result"]["isError"]);
+
+    json omitted = {{"jsonrpc", "2.0"}, {"id", 71}, {"method", "tools/call"},
+                    {"params", {{"name", "no_args"}}}};
+    auto without = mcp_post(*cli_, "/mcp", omitted, sid);
+    EXPECT_FALSE(without["_body"]["result"]["isError"]);
+
+    EXPECT_EQ(calls.load(), 2);
+}
+
 TEST_F(ServerTest, UnsupportedToolSchemaKeywordFailsClosed) {
     tool referenced;
     referenced.name = "referenced";

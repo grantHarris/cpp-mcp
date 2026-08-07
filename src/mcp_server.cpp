@@ -994,6 +994,15 @@ void server::register_tool(const tool& tool, tool_handler handler) {
 
             json tool_args = params.contains("arguments") ? params["arguments"] : json::object();
 
+            // "arguments" is optional in the spec, so an explicit null means the
+            // same thing as omitting the key. Clients routinely send it that way
+            // for no-argument tools - our own sse_client does, since a default
+            // constructed json is null - and schema validation would otherwise
+            // reject every such call with "arguments must be of type 'object'".
+            if (tool_args.is_null()) {
+                tool_args = json::object();
+            }
+
             if (tool_args.is_string()) {
                 try {
                     tool_args = json::parse(tool_args.get<std::string>());
