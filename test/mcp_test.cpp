@@ -1661,3 +1661,65 @@ TEST(EventDispatcher, OverflowReturnsFalseRatherThanBlocking) {
     // One slot freed — next send succeeds.
     EXPECT_TRUE(dispatcher.send_event("y"));
 }
+
+// clientInfo is the only identity a client volunteers, and it arrives once at
+// initialize. Discarding it leaves a server operator unable to tell their own
+// tooling apart from a client they did not start -- which matters most when the
+// transport has no authentication.
+TEST_F(ServerTest, InitializeRetainsClientIdentity) {
+    auto [sid, _] = mcp_initialize(*cli_);
+
+    auto sessions = srv_->get_sessions();
+    ASSERT_EQ(1u, sessions.size());
+    EXPECT_EQ(sid, sessions[0].session_id);
+    EXPECT_FALSE(sessions[0].client_name.empty()) << "clientInfo.name was discarded";
+    EXPECT_FALSE(sessions[0].protocol_version.empty());
+    EXPECT_GT(sessions[0].connected_at_unix, 0);
+}
+
+TEST_F(ServerTest, ToolCallsAreCountedPerSession) {
+    tool counted;
+    counted.name = "counted";
+    counted.description = "Counts";
+    counted.parameters_schema = {{"type", "object"}};
+    srv_->register_tool(counted, [](const json&, const std::string&) -> json {
+        return json::array({{{"type", "text"}, {"text", "ok"}}});
+    });
+
+    auto [sid, _] = mcp_initialize(*cli_);
+    for (int i = 0; i < 3; ++i) {
+        json request = {{"jsonrpc", "2.0"}, {"id", 80 + i}, {"method", "tools/call"},
+                        {"params", {{"name", "counted"}, {"arguments", json::object()}}}};
+        mcp_post(*cli_, "/mcp", request, sid);
+    }
+
+    auto sessions = srv_->get_sessions();
+    ASSERT_EQ(1u, sessions.size());
+    EXPECT_EQ(3u, sessions[0].tool_call_count);
+    EXPECT_GT(sessions[0].last_seen_unix, 0);
+}
+
+// Sessions are tracked independently, so a status view can distinguish two
+// clients rather than collapsing them.
+//
+// Not covered here: forgetting a session on disconnect. close_session is
+// private and the timeout path is too slow for a unit test; the erase sits
+// beside the other per-session cleanup, which is the same path those already
+// exercise.
+TEST_F(ServerTest, SessionsAreTrackedIndependently) {
+    auto [sid_a, _a] = mcp_initialize(*cli_);
+
+    httplib::Client second("localhost", port_);
+    auto [sid_b, _b] = mcp_initialize(second);
+
+    ASSERT_NE(sid_a, sid_b);
+    auto sessions = srv_->get_sessions();
+    ASSERT_EQ(2u, sessions.size());
+
+    std::set<std::string> ids;
+    for (const auto& s : sessions) {
+        ids.insert(s.session_id);
+    }
+    EXPECT_EQ(1u, ids.count(sid_a));
+    EXPECT_EQ(1u, ids.count(sid_b));
+}

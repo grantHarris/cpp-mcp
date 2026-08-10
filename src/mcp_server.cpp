@@ -446,6 +446,13 @@ bool validate_schema_type(const mcp::json& schema,
     return true;
 }
 
+int64_t unix_now() {
+    return static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+}
+
 bool validate_tool_arguments(const mcp::json& schema,
                              const mcp::json& args,
                              std::string& error) {
@@ -992,6 +999,14 @@ void server::register_tool(const tool& tool, tool_handler handler) {
                 return tool_error("Tool not found: " + tool_name);
             }
 
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                auto it_session = session_clients_.find(session_id);
+                if (it_session != session_clients_.end()) {
+                    ++it_session->second.tool_call_count;
+                }
+            }
+
             json tool_args = params.contains("arguments") ? params["arguments"] : json::object();
 
             // "arguments" is optional in the spec, so an explicit null means the
@@ -1112,6 +1127,31 @@ void server::set_auth_handler(auth_handler handler) {
     std::lock_guard<std::mutex> lock(mutex_);
     auth_handler_ = std::move(handler);
     detailed_auth_handler_ = {};
+}
+
+void server::touch_session(const std::string& session_id, const std::string& remote_addr) {
+    if (session_id.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = session_clients_.find(session_id);
+    if (it == session_clients_.end()) {
+        return; // not initialized yet; identity arrives with initialize
+    }
+    it->second.last_seen_unix = unix_now();
+    if (!remote_addr.empty()) {
+        it->second.remote_addr = remote_addr;
+    }
+}
+
+std::vector<session_info> server::get_sessions() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<session_info> out;
+    out.reserve(session_clients_.size());
+    for (const auto& entry : session_clients_) {
+        out.push_back(entry.second);
+    }
+    return out;
 }
 
 void server::set_detailed_auth_handler(detailed_auth_handler handler) {
@@ -1564,6 +1604,7 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
 
     // Get or create session
     std::string session_id = req.get_header_value("Mcp-Session-Id");
+    touch_session(session_id, req.remote_addr);
 
     const auto authorization = authorize_request(req, session_id);
     if (authorization.status != auth_status::authorized) {
@@ -1732,6 +1773,7 @@ void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res)
     set_cors_headers(req, res, "GET, OPTIONS");
 
     std::string session_id = req.get_header_value("Mcp-Session-Id");
+    touch_session(session_id, req.remote_addr);
     const auto authorization = authorize_request(req, session_id);
     if (authorization.status != auth_status::authorized) {
         reject_authorization(res, authorization);
@@ -1824,6 +1866,7 @@ void server::handle_mcp_delete(const httplib::Request& req, httplib::Response& r
     set_cors_headers(req, res, "DELETE, OPTIONS");
 
     std::string session_id = req.get_header_value("Mcp-Session-Id");
+    touch_session(session_id, req.remote_addr);
     const auto authorization = authorize_request(req, session_id);
     if (authorization.status != auth_status::authorized) {
         reject_authorization(res, authorization);
@@ -2043,6 +2086,16 @@ json server::handle_initialize(const request& req, const std::string& session_id
     {
         std::lock_guard<std::mutex> lock(mutex_);
         session_protocol_versions_[session_id] = negotiated_version;
+
+        // clientInfo arrives once, here. Keeping it is what lets an operator
+        // tell their own tooling apart from a client they did not start.
+        auto& info = session_clients_[session_id];
+        info.session_id = session_id;
+        info.client_name = client_name;
+        info.client_version = client_version;
+        info.protocol_version = negotiated_version;
+        info.connected_at_unix = unix_now();
+        info.last_seen_unix = info.connected_at_unix;
     }
 
     json result = {
@@ -2385,6 +2438,7 @@ void server::close_session(const std::string& session_id) {
 
         session_initialized_.erase(session_id);
         session_protocol_versions_.erase(session_id);
+        session_clients_.erase(session_id);
         session_log_levels_.erase(session_id);
         cancelled_requests_.erase(session_id);
         // Copy cleanup handlers so we can invoke them without holding the lock.
