@@ -71,6 +71,24 @@ using detailed_auth_handler =
 using session_cleanup_handler = std::function<void(const std::string&)>;
 
 /**
+ * @brief What is known about one connected client.
+ *
+ * clientInfo is the only identity a client volunteers, and it arrives once at
+ * initialize. Retaining it is what lets a server operator tell their own tooling
+ * apart from something they did not start.
+ */
+struct session_info {
+    std::string session_id;
+    std::string client_name;
+    std::string client_version;
+    std::string remote_addr;
+    std::string protocol_version;
+    int64_t connected_at_unix = 0;
+    int64_t last_seen_unix = 0;
+    uint64_t tool_call_count = 0;
+};
+
+/**
  * @brief Prompt argument definition
  */
 struct prompt_argument {
@@ -512,6 +530,19 @@ public:
     void set_detailed_auth_handler(detailed_auth_handler handler);
 
     /**
+     * @brief Snapshot of the currently connected sessions.
+     * @return One entry per live session, in no particular order.
+     */
+    std::vector<session_info> get_sessions() const;
+
+  private:
+    // Refreshes last_seen and remote_addr for a live session. No-op before
+    // initialize, since identity arrives with it.
+    void touch_session(const std::string& session_id, const std::string& remote_addr);
+
+  public:
+
+    /**
      * @brief Send a request (or notification) to a client
      * @param session_id The session ID of the client
      * @param req The request to send
@@ -665,6 +696,10 @@ private:
 
     // Map to track per-session negotiated MCP protocol version
     std::map<std::string, std::string> session_protocol_versions_;
+
+    // Per-session client identity, populated at initialize and refreshed on
+    // each request. Erased with the rest of the session state on cleanup.
+    std::map<std::string, session_info> session_clients_;
 
     // Origin allowlist (empty = no Origin check)
     std::vector<std::string> allowed_origins_;
