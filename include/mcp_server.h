@@ -695,7 +695,9 @@ private:
     mutable std::mutex mutex_;
     
     // Running flag
-    bool running_ = false;
+    // Atomic: the listener thread clears this when listen() fails, while the
+    // thread that called start() is polling is_running() to find out.
+    std::atomic<bool> running_{false};
 
     // Max sessions limit
     unsigned int max_sessions_ = MCP_MAX_SESSIONS;
