@@ -621,12 +621,18 @@ bool server::start(bool blocking) {
 }
 
 void server::stop() {
-    if (!running_) {
+    // running_ being false is not proof there is nothing to tear down. A failed
+    // listen() clears it from the listener thread while server_thread_ is still
+    // joinable, and ~unique_ptr<std::thread> on a joinable thread calls
+    // std::terminate -- so returning early here aborted the whole host process
+    // on the one path that matters: another process already holding the port.
+    // Bail only when there is genuinely nothing left to join.
+    const bool was_running = running_.exchange(false);
+    if (!was_running && !(server_thread_ && server_thread_->joinable())) {
         return;
     }
-    
+
     LOG_INFO("Stopping MCP server on ", host_, ":", port_);
-    running_ = false;
 
     stop_maintenance_thread();
     
