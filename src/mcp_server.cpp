@@ -1112,6 +1112,11 @@ void server::register_session_cleanup(const std::string& key, session_cleanup_ha
     session_cleanup_handler_[key] = handler;
 }
 
+void server::register_session_open(const std::string& key, session_open_handler handler) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    session_open_handler_[key] = handler;
+}
+
 std::vector<tool> server::get_tools() const {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<tool> tools;
@@ -2096,6 +2101,23 @@ json server::handle_initialize(const request& req, const std::string& session_id
         info.protocol_version = negotiated_version;
         info.connected_at_unix = unix_now();
         info.last_seen_unix = info.connected_at_unix;
+    }
+
+    // Announce the session now that session_clients_ holds it, so a handler
+    // that calls get_sessions() sees the client it is being told about. Copied
+    // under the lock and invoked outside it: a handler is host code and may do
+    // arbitrary work, including calling back into this server.
+    {
+        std::map<std::string, session_open_handler> open_handlers_copy;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            open_handlers_copy = session_open_handler_;
+        }
+        for (const auto& entry : open_handlers_copy) {
+            if (entry.second) {
+                entry.second(session_id);
+            }
+        }
     }
 
     json result = {

@@ -70,6 +70,11 @@ using detailed_auth_handler =
     std::function<auth_result(const std::string&, const std::string&)>;
 using session_cleanup_handler = std::function<void(const std::string&)>;
 
+// Called once per session, after initialize has recorded the client's identity.
+// The counterpart to session_cleanup_handler: between the two, a host can track
+// exactly which clients are attached without polling get_sessions().
+using session_open_handler = std::function<void(const std::string&)>;
+
 /**
  * @brief What is known about one connected client.
  *
@@ -503,7 +508,17 @@ public:
      * @param handler The function to call when the session is closed
      */
     void register_session_cleanup(const std::string& key, session_cleanup_handler handler);
-    
+
+    /**
+     * @brief Register a session open handler
+     * @param key Identifies the registrant, so re-registering replaces rather
+     *            than accumulates -- same convention as register_session_cleanup
+     * @param handler Called with the session id once initialize has recorded
+     *                the client's identity, so get_sessions() already includes
+     *                it. Invoked outside the server lock.
+     */
+    void register_session_open(const std::string& key, session_open_handler handler);
+
     /**
      * @brief Get the list of available tools
      * @return JSON array of available tools
@@ -812,6 +827,7 @@ private:
 
     // Session cleanup handler
     std::map<std::string, session_cleanup_handler> session_cleanup_handler_;
+    std::map<std::string, session_open_handler> session_open_handler_;
 
     // Close session
     void close_session(const std::string& session_id);

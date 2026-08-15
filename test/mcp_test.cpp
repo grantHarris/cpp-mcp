@@ -1677,6 +1677,56 @@ TEST_F(ServerTest, InitializeRetainsClientIdentity) {
     EXPECT_GT(sessions[0].connected_at_unix, 0);
 }
 
+// A host tracking who is attached has register_session_cleanup for the way out
+// but nothing for the way in, leaving it to poll get_sessions() to notice a
+// connection. The handler must fire after the session is recorded, or a host
+// that responds by reading get_sessions() would not find the client it was just
+// told about.
+TEST_F(ServerTest, SessionOpenHandlerFiresAfterTheSessionIsRecorded) {
+    std::mutex seen_mutex;
+    std::vector<std::string> opened;
+    std::vector<size_t> visible_session_counts;
+
+    srv_->register_session_open("test", [&](const std::string& session_id) {
+        std::lock_guard<std::mutex> lock(seen_mutex);
+        opened.push_back(session_id);
+        visible_session_counts.push_back(srv_->get_sessions().size());
+    });
+
+    auto [sid, _] = mcp_initialize(*cli_);
+
+    std::lock_guard<std::mutex> lock(seen_mutex);
+    ASSERT_EQ(1u, opened.size()) << "handler should fire exactly once per session";
+    EXPECT_EQ(sid, opened[0]);
+    ASSERT_EQ(1u, visible_session_counts.size());
+    EXPECT_EQ(1u, visible_session_counts[0])
+        << "get_sessions() must already include the session being announced";
+}
+
+// Re-registering under the same key replaces, matching register_session_cleanup.
+// Without this a host that restarts its bookkeeping would stack duplicate
+// handlers and emit one event per registration.
+TEST_F(ServerTest, SessionOpenHandlerKeyReplacesRatherThanAccumulates) {
+    std::mutex seen_mutex;
+    int first_calls = 0;
+    int second_calls = 0;
+
+    srv_->register_session_open("test", [&](const std::string&) {
+        std::lock_guard<std::mutex> lock(seen_mutex);
+        ++first_calls;
+    });
+    srv_->register_session_open("test", [&](const std::string&) {
+        std::lock_guard<std::mutex> lock(seen_mutex);
+        ++second_calls;
+    });
+
+    mcp_initialize(*cli_);
+
+    std::lock_guard<std::mutex> lock(seen_mutex);
+    EXPECT_EQ(0, first_calls) << "replaced handler should not still fire";
+    EXPECT_EQ(1, second_calls);
+}
+
 TEST_F(ServerTest, ToolCallsAreCountedPerSession) {
     tool counted;
     counted.name = "counted";
