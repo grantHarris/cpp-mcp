@@ -605,6 +605,30 @@ bool server::start(bool blocking) {
         }
         return true;
     } else {
+        // SO_REUSEADDR only -- explicitly NOT httplib's default, which sets
+        // SO_REUSEPORT wherever the platform defines it (Linux, macOS). Under
+        // SO_REUSEPORT a second process binds the same port happily and the
+        // kernel load-balances connections between them, so two servers both
+        // report success and each sees an arbitrary half of the traffic. For a
+        // control interface that is worse than failing: the operator gets a
+        // server that works when tested and drops requests in production.
+        //
+        // SO_REUSEADDR keeps the property actually wanted -- rebinding a port
+        // left in TIME_WAIT by a previous run, so a restart does not have to
+        // wait -- while still refusing a port another live listener holds.
+        http_server_->set_socket_options([](socket_t sock) {
+            int yes = 1;
+#ifdef _WIN32
+            setsockopt(sock,
+                       SOL_SOCKET,
+                       SO_REUSEADDR,
+                       reinterpret_cast<const char*>(&yes),
+                       sizeof(yes));
+#else
+            setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+#endif
+        });
+
         // Bind on THIS thread, so start() returns the bind outcome as a fact.
         //
         // listen() bundles bind and accept-loop, so running it on the worker
