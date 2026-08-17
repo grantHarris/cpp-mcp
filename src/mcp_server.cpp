@@ -605,17 +605,35 @@ bool server::start(bool blocking) {
         }
         return true;
     } else {
-        // Start server in a separate thread
+        // Bind on THIS thread, so start() returns the bind outcome as a fact.
+        //
+        // listen() bundles bind and accept-loop, so running it on the worker
+        // made failure observable only asynchronously: start() returned true
+        // for a server that never bound, and a host could do no better than
+        // poll is_running() or probe the port with a TCP connect. Neither is
+        // sound -- the listener may not have reached its failure yet, and on
+        // platforms that set SO_REUSEPORT a successful connect does not even
+        // prove who owns the port. bind_to_port() answers definitively before
+        // any of that guesswork starts.
+        if (!http_server_->bind_to_port(host_.c_str(), port_)) {
+            stop_maintenance_thread();
+            LOG_ERROR("Failed to bind ", host_, ":", port_);
+            return false;
+        }
+
+        // Set before spawning, not after. The old order let a listener that
+        // failed instantly clear running_ and then have it overwritten with
+        // true by this thread, latching "running" onto a dead server.
+        running_ = true;
+
         server_thread_ = std::make_unique<std::thread>([this]() {
-            LOG_INFO("Starting server in separate thread");
-            if (!http_server_->listen(host_.c_str(), port_)) {
-                LOG_ERROR("Failed to start server on ", host_, ":", port_);
+            LOG_INFO("Serving on ", host_, ":", port_);
+            if (!http_server_->listen_after_bind()) {
+                LOG_ERROR("Accept loop ended unexpectedly on ", host_, ":", port_);
                 running_ = false;
                 stop_maintenance_thread();
-                return;
             }
         });
-        running_ = true;
         return true;
     }
 }
