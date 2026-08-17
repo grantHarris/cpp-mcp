@@ -767,6 +767,57 @@ TEST(ServerLifecycle, StartReportsSuccessOnlyOnceBound) {
 // that is still joinable even after the thread has finished -- was destroyed
 // unjoined, which calls std::terminate. A host has no way to defend against it:
 // the crash happens inside the destructor of a server it was told had failed.
+// A port another live server holds must be refused. httplib's default socket
+// options set SO_REUSEPORT wherever the platform defines it, which silently
+// permits a second bind and has the kernel load-balance connections between
+// the two -- so both servers report success and each serves an arbitrary half
+// of the traffic. For a control interface that is worse than failing outright:
+// it works when tested and drops requests in production, and no amount of
+// checking the bind result downstream can detect it.
+TEST(ServerLifecycle, SecondServerCannotStealAPortInUse) {
+    const int port = next_port();
+
+    server::configuration held;
+    held.host = "127.0.0.1";
+    held.port = port;
+    held.name = "Holder";
+    held.version = "1.0.0";
+
+    server holder(held);
+    ASSERT_TRUE(holder.start(false)) << "the first server must get the port";
+
+    server::configuration contender = held;
+    contender.name = "Contender";
+
+    server second(contender);
+    EXPECT_FALSE(second.start(false)) << "a port already served must not be shared";
+    EXPECT_FALSE(second.is_running());
+
+    holder.stop();
+}
+
+// The property SO_REUSEADDR is actually kept for: a port left in TIME_WAIT by a
+// previous run rebinds immediately, so a restart does not have to wait.
+TEST(ServerLifecycle, PortIsReusableAfterTheHolderStops) {
+    const int port = next_port();
+
+    server::configuration conf;
+    conf.host = "127.0.0.1";
+    conf.port = port;
+    conf.name = "Restarts";
+    conf.version = "1.0.0";
+
+    {
+        server first(conf);
+        ASSERT_TRUE(first.start(false));
+        first.stop();
+    }
+
+    server second(conf);
+    EXPECT_TRUE(second.start(false)) << "a released port must rebind without waiting";
+    second.stop();
+}
+
 TEST(ServerLifecycle, DestroyingAServerThatFailedToBindDoesNotTerminate) {
     server::configuration conf;
     conf.host = "192.0.2.1";
