@@ -68,6 +68,9 @@ struct auth_result {
 
 using detailed_auth_handler =
     std::function<auth_result(const std::string&, const std::string&)>;
+// Called once for each registered cleanup hook when a session closes. The
+// argument is the closing session id; the registration key identifies the hook
+// itself and is never substituted for the session id.
 using session_cleanup_handler = std::function<void(const std::string&)>;
 
 // Called once per session, after initialize has recorded the client's identity.
@@ -504,8 +507,10 @@ public:
 
     /**
      * @brief Register a session cleanup handler
-     * @param key Tool or resource name to be cleaned up
-     * @param handler The function to call when the session is closed
+     * @param key Identifies the registrant, so re-registering replaces rather
+     *            than accumulates
+     * @param handler Called with the closing session id after its server-side
+     *                state has been removed. Invoked outside the server lock.
      */
     void register_session_cleanup(const std::string& key, session_cleanup_handler handler);
 
@@ -777,10 +782,14 @@ private:
     void send_jsonrpc(const std::string& session_id, const json& message);
     
     // Process a JSON-RPC request
-    json process_request(const request& req, const std::string& session_id);
+    json process_request(const request& req,
+                         const std::string& session_id,
+                         const std::string& remote_addr = "");
     
     // Handle initialization request
-    json handle_initialize(const request& req, const std::string& session_id);
+    json handle_initialize(const request& req,
+                           const std::string& session_id,
+                           const std::string& remote_addr = "");
     
     // Check if a session is initialized
     bool is_session_initialized(const std::string& session_id) const;

@@ -1360,6 +1360,7 @@ void server::handle_jsonrpc(const httplib::Request& req, httplib::Response& res)
     }
     auto sid_it = req.params.find("session_id");
     std::string session_id = sid_it != req.params.end() ? sid_it->second : "";
+    touch_session(session_id, req.remote_addr);
 
     // Setup response headers
     res.set_header("Content-Type", "application/json");
@@ -1446,8 +1447,9 @@ void server::handle_jsonrpc(const httplib::Request& req, httplib::Response& res)
     if (mcp_req.is_notification()) {
         // Process it asynchronously in the thread pool
         try {
-            thread_pool_.enqueue([this, mcp_req, session_id]() {
-                process_request(mcp_req, session_id);
+            const std::string remote_addr = req.remote_addr;
+            thread_pool_.enqueue([this, mcp_req, session_id, remote_addr]() {
+                process_request(mcp_req, session_id, remote_addr);
             });
         } catch (const std::exception& e) {
             LOG_WARNING("Failed to enqueue notification: ", e.what());
@@ -1464,9 +1466,10 @@ void server::handle_jsonrpc(const httplib::Request& req, httplib::Response& res)
     
     // For requests with ID, process it asynchronously in the thread pool and return the result via SSE
     try {
-        thread_pool_.enqueue([this, mcp_req, session_id, dispatcher]() {
+        const std::string remote_addr = req.remote_addr;
+        thread_pool_.enqueue([this, mcp_req, session_id, remote_addr, dispatcher]() {
             // Process the request
-            json response_json = process_request(mcp_req, session_id);
+            json response_json = process_request(mcp_req, session_id, remote_addr);
 
             // Send response via SSE
             std::stringstream ss;
@@ -1768,7 +1771,7 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
     bool has_request_id = body.contains("id") && !body["id"].is_null();
     if (!has_request_id) {
         if (!session_id.empty()) {
-            process_request(mcp_req, session_id);
+            process_request(mcp_req, session_id, req.remote_addr);
         }
         res.status = 202;
         return;
@@ -1797,13 +1800,14 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
             session_dispatchers_[session_id] = session_dispatcher;
         }
 
-        json result = handle_initialize(mcp_req, session_id);
+        json result = handle_initialize(mcp_req, session_id, req.remote_addr);
 
         res.set_header("Mcp-Session-Id", session_id);
         // Override the placeholder set at the top of the handler now that we
         // know what version was negotiated.
         std::string negotiated = session_protocol_version(session_id);
         if (!negotiated.empty()) {
+            res.headers.erase("MCP-Protocol-Version");
             res.set_header("MCP-Protocol-Version", negotiated);
         }
         res.set_header("Content-Type", "application/json");
@@ -1812,7 +1816,7 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
     }
 
     // Non-initialize request with an id: process synchronously and return inline JSON.
-    json result = process_request(mcp_req, session_id);
+    json result = process_request(mcp_req, session_id, req.remote_addr);
     res.set_header("Content-Type", "application/json");
     res.set_content(result.dump(), "application/json");
 }
@@ -1958,7 +1962,9 @@ void server::handle_mcp_delete(const httplib::Request& req, httplib::Response& r
     res.status = 200;
 }
 
-json server::process_request(const request& req, const std::string& session_id) {
+json server::process_request(const request& req,
+                             const std::string& session_id,
+                             const std::string& remote_addr) {
     // Check if it is a notification
     if (req.is_notification()) {
         if (req.method == "notifications/initialized") {
@@ -2000,7 +2006,7 @@ json server::process_request(const request& req, const std::string& session_id) 
         
         // Special case: initialization
         if (req.method == "initialize") {
-            return handle_initialize(req, session_id);
+            return handle_initialize(req, session_id, remote_addr);
         } else if (req.method == "ping") {
             return response::create_success(req.id, json::object()).to_json();
         } else if (req.method == "logging/setLevel") {
@@ -2086,7 +2092,9 @@ json server::process_request(const request& req, const std::string& session_id) 
     }
 }
 
-json server::handle_initialize(const request& req, const std::string& session_id) {
+json server::handle_initialize(const request& req,
+                               const std::string& session_id,
+                               const std::string& remote_addr) {
     const json& params = req.params;
 
     // Version negotiation
@@ -2146,6 +2154,7 @@ json server::handle_initialize(const request& req, const std::string& session_id
         info.session_id = session_id;
         info.client_name = client_name;
         info.client_version = client_version;
+        info.remote_addr = remote_addr;
         info.protocol_version = negotiated_version;
         info.connected_at_unix = unix_now();
         info.last_seen_unix = info.connected_at_unix;
@@ -2526,8 +2535,9 @@ void server::close_session(const std::string& session_id) {
     // would deadlock.
     try {
         for (const auto& [key, handler] : cleanup_handlers_copy) {
+            (void)key;
             try {
-                handler(key);
+                handler(session_id);
             } catch (const std::exception& e) {
                 LOG_WARNING("Session cleanup handler threw: ", session_id, ", ", e.what());
             } catch (...) {

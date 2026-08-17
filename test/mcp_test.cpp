@@ -419,7 +419,7 @@ TEST_F(ServerTest, InitializeResponseSendsProtocolVersionHeader) {
     json init_req = {
         {"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"},
         {"params", {
-            {"protocolVersion", "2025-11-25"},
+            {"protocolVersion", "2025-03-26"},
             {"clientInfo", {{"name", "T"}, {"version", "1"}}},
             {"capabilities", json::object()}
         }}
@@ -431,7 +431,8 @@ TEST_F(ServerTest, InitializeResponseSendsProtocolVersionHeader) {
     auto res = cli_->Post("/mcp", h, init_req.dump(), "application/json");
     ASSERT_TRUE(res);
     EXPECT_EQ(res->status, 200);
-    EXPECT_EQ(res->get_header_value("MCP-Protocol-Version"), "2025-11-25");
+    EXPECT_EQ(res->get_header_value_count("MCP-Protocol-Version"), 1u);
+    EXPECT_EQ(res->get_header_value("MCP-Protocol-Version"), "2025-03-26");
 }
 
 TEST_F(ServerTest, RejectsMismatchedProtocolVersionHeader) {
@@ -1819,6 +1820,58 @@ TEST_F(ServerTest, SessionOpenHandlerFiresAfterTheSessionIsRecorded) {
     ASSERT_EQ(1u, visible_session_counts.size());
     EXPECT_EQ(1u, visible_session_counts[0])
         << "get_sessions() must already include the session being announced";
+}
+
+// The initialize request is the one request guaranteed to carry the peer
+// address before the open hook publishes a client snapshot. Recording the
+// address only on later requests leaves that first snapshot incomplete -- and
+// legacy SSE sessions never refreshed it at all.
+TEST_F(ServerTest, SessionOpenHandlerSeesTheInitializingPeerAddress) {
+    std::string remote_at_open;
+
+    srv_->register_session_open("test", [&](const std::string& session_id) {
+        for (const auto& session : srv_->get_sessions()) {
+            if (session.session_id == session_id) {
+                remote_at_open = session.remote_addr;
+            }
+        }
+    });
+
+    mcp_initialize(*cli_);
+
+    EXPECT_FALSE(remote_at_open.empty());
+}
+
+// Cleanup hooks are server-wide registrants, not per-session callbacks. Every
+// registrant must receive the one session that is actually closing; passing
+// each hook's registration key made a host either clean the wrong session or
+// register one hook per session and clean every client on any disconnect.
+TEST_F(ServerTest, CleanupHandlersReceiveOnlyTheClosingSessionId) {
+    auto [sid_a, _a] = mcp_initialize(*cli_);
+
+    httplib::Client second("127.0.0.1", port_);
+    auto [sid_b, _b] = mcp_initialize(second);
+    ASSERT_NE(sid_a, sid_b);
+
+    std::vector<std::string> first_seen;
+    std::vector<std::string> second_seen;
+    srv_->register_session_cleanup(
+        "first", [&](const std::string& session_id) { first_seen.push_back(session_id); });
+    srv_->register_session_cleanup(
+        "second", [&](const std::string& session_id) { second_seen.push_back(session_id); });
+
+    httplib::Headers headers;
+    headers.emplace("Mcp-Session-Id", sid_a);
+    auto deleted = cli_->Delete("/mcp", headers);
+    ASSERT_TRUE(deleted);
+    ASSERT_EQ(200, deleted->status);
+
+    EXPECT_EQ(std::vector<std::string>{sid_a}, first_seen);
+    EXPECT_EQ(std::vector<std::string>{sid_a}, second_seen);
+
+    const auto remaining = srv_->get_sessions();
+    ASSERT_EQ(1u, remaining.size());
+    EXPECT_EQ(sid_b, remaining.front().session_id);
 }
 
 // Re-registering under the same key replaces, matching register_session_cleanup.
