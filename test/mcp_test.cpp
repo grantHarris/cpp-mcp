@@ -719,21 +719,57 @@ TEST(Authentication, DetailedHandlerReturnsScopeChallenge) {
     srv.stop();
 }
 
+// start(false) must report the bind outcome, not just that a thread was
+// spawned. Before this, listen() ran bind and accept-loop together on the
+// worker, so start() returned true for a server that never bound and the host
+// was left to infer failure -- by polling is_running(), or by probing the port
+// with a TCP connect, which does not even identify the owner where
+// SO_REUSEPORT is in play. The bind is forced to fail with an address this
+// machine does not own (RFC 5737 TEST-NET-1).
+TEST(ServerLifecycle, StartReportsBindFailureSynchronously) {
+    server::configuration conf;
+    conf.host = "192.0.2.1";  // TEST-NET-1: guaranteed not a local address
+    conf.port = next_port();
+    conf.name = "CannotBind";
+    conf.version = "1.0.0";
+
+    server losing(conf);
+    EXPECT_FALSE(losing.start(false)) << "start() must return the bind failure";
+    EXPECT_FALSE(losing.is_running());
+}
+
+// A successful start still reports true, and the server is actually reachable
+// by the time start() returns -- the point of binding on the calling thread.
+TEST(ServerLifecycle, StartReportsSuccessOnlyOnceBound) {
+    server::configuration conf;
+    conf.host = "127.0.0.1";
+    conf.port = next_port();
+    conf.name = "Binds";
+    conf.version = "1.0.0";
+
+    server winner(conf);
+    ASSERT_TRUE(winner.start(false));
+    EXPECT_TRUE(winner.is_running());
+
+    // No sleep, no polling: if start() only returns after the bind, the port
+    // is already accepting.
+    httplib::Client cli("127.0.0.1", conf.port);
+    cli.set_connection_timeout(2);
+    auto res = cli.Get("/");
+    EXPECT_TRUE(res) << "port should be accepting the moment start() returns";
+
+    winner.stop();
+}
+
 // Destroying a server whose listen() failed used to abort the host process.
 // The listener thread clears running_ when the bind fails, stop() returned
 // early on exactly that flag, and so server_thread_ -- a unique_ptr<std::thread>
 // that is still joinable even after the thread has finished -- was destroyed
 // unjoined, which calls std::terminate. A host has no way to defend against it:
 // the crash happens inside the destructor of a server it was told had failed.
-//
-// The bind is forced to fail by asking for an address this machine does not
-// own (RFC 5737 TEST-NET-1). Holding the port with a second listener does not
-// reproduce it: SO_REUSEPORT lets both binds succeed on macOS, which is worth
-// knowing on its own -- a port conflict is not reliably detectable by bind
-// failure there.
 TEST(ServerLifecycle, DestroyingAServerThatFailedToBindDoesNotTerminate) {
     server::configuration conf;
-    conf.host = "192.0.2.1";  // TEST-NET-1: guaranteed not a local address
+    conf.host = "192.0.2.1";
     conf.port = next_port();
     conf.name = "CannotBind";
     conf.version = "1.0.0";
@@ -741,12 +777,7 @@ TEST(ServerLifecycle, DestroyingAServerThatFailedToBindDoesNotTerminate) {
     {
         auto losing = std::make_unique<server>(conf);
         losing->start(false);
-
-        // Let the listener thread discover the failure and clear running_.
-        for (int i = 0; i < 200 && losing->is_running(); ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-        ASSERT_FALSE(losing->is_running()) << "bind to TEST-NET-1 should have failed";
+        ASSERT_FALSE(losing->is_running());
 
         // The assertion is that this scope exits at all: the destructor runs
         // here, and before the fix it aborted the process.
