@@ -37,6 +37,39 @@
 
 namespace mcp {
 
+/**
+ * @brief Everything a handler may want to know about the request it is serving.
+ *
+ * Today all of it is derived from the transport session that initialize() set
+ * up. MCP 2026-07-28 removes sessions and moves the same facts into each
+ * request's params._meta; handlers written against request_context keep working
+ * unchanged when that path is added, because nothing here promises a session.
+ *
+ * session_id is the legacy transport handle and is empty when a request arrives
+ * without one. Treat it as an opaque key for correlating later pushes (send_log,
+ * send_progress) with the request that asked for them, not as an identity.
+ */
+struct request_context {
+    std::string session_id;
+    std::string protocol_version;
+    std::string client_name;
+    std::string client_version;
+    json client_capabilities = json::object();
+    std::string log_level = "warning";
+    std::string remote_addr;
+    json request_id;
+    json meta = json::object();
+
+    bool has_session() const { return !session_id.empty(); }
+};
+
+// Context-aware handler signatures. Prefer these for new code.
+using context_method_handler = std::function<json(const json&, const request_context&)>;
+using context_tool_handler = context_method_handler;
+using context_prompt_handler = context_method_handler;
+
+// Legacy (params, session_id) signatures. Still accepted everywhere; they are
+// adapted onto the context form at registration.
 using method_handler = std::function<json(const json&, const std::string&)>;
 using tool_handler = method_handler;
 using notification_handler = std::function<void(const json&, const std::string&)>;
@@ -91,6 +124,7 @@ struct session_info {
     std::string client_version;
     std::string remote_addr;
     std::string protocol_version;
+    json client_capabilities = json::object();
     int64_t connected_at_unix = 0;
     int64_t last_seen_unix = 0;
     uint64_t tool_call_count = 0;
@@ -455,6 +489,7 @@ public:
      * @param handler The function to call when the method is invoked
      */
     void register_method(const std::string& method, method_handler handler);
+    void register_method(const std::string& method, context_method_handler handler);
     
     /**
      * @brief Register a notification handler
@@ -496,6 +531,7 @@ public:
      * @param handler The function to call when the tool is invoked
      */
     void register_tool(const tool& tool, tool_handler handler);
+    void register_tool(const tool& tool, context_tool_handler handler);
 
     /**
      * @brief Register a prompt
@@ -504,6 +540,7 @@ public:
      *                Must return JSON with a "messages" array of {role, content} objects
      */
     void register_prompt(const prompt& prompt, prompt_handler handler);
+    void register_prompt(const prompt& prompt, context_prompt_handler handler);
 
     /**
      * @brief Register a session cleanup handler
@@ -619,6 +656,25 @@ public:
      */
     bool is_cancelled(const json& request_id, const std::string& session_id) const;
 
+    // Context-aware equivalents of the send_*/is_cancelled calls above. They
+    // route to whatever transport the request arrived on; callers that hold a
+    // request_context should use these rather than pulling out session_id.
+    void send_log(const request_context& ctx, const std::string& level,
+                  const std::string& logger, const json& data);
+    void send_progress(const request_context& ctx, const json& progress_token,
+                       double progress, double total = -1, const std::string& message = "");
+    bool is_cancelled(const request_context& ctx) const;
+
+    /**
+     * @brief Whether a session is still attached.
+     *
+     * Cheaper and race-tighter than scanning get_sessions(): the answer comes
+     * from the same lock that close_session() takes before running cleanup
+     * handlers, so a caller holding its own lock around this call and around
+     * its cleanup handler sees a consistent ordering.
+     */
+    bool is_session_alive(const std::string& session_id) const;
+
     /**
      * @brief Get the negotiated MCP protocol version for a session
      * @param session_id The session ID to query
@@ -665,7 +721,7 @@ private:
     std::string mcp_endpoint_;
     
     // Method handlers
-    std::map<std::string, method_handler> method_handlers_;
+    std::map<std::string, context_method_handler> method_handlers_;
     
     // Notification handlers
     std::map<std::string, notification_handler> notification_handlers_;
@@ -684,10 +740,10 @@ private:
     std::vector<resource_template_entry> resource_templates_;
 
     // Tools map (name -> handler)
-    std::map<std::string, std::pair<tool, tool_handler>> tools_;
+    std::map<std::string, std::pair<tool, context_tool_handler>> tools_;
 
     // Prompts map (name -> {prompt, handler})
-    std::map<std::string, std::pair<prompt, prompt_handler>> prompts_;
+    std::map<std::string, std::pair<prompt, context_prompt_handler>> prompts_;
 
     // Authentication handler
     auth_handler auth_handler_;
@@ -799,6 +855,20 @@ private:
 
     // Generate a random session ID
     std::string generate_session_id() const;
+
+    // Assemble the request_context for a request arriving on a legacy session.
+    // Takes mutex_ internally.
+    request_context make_request_context(const request& req,
+                                         const std::string& session_id,
+                                         const std::string& remote_addr) const;
+
+    // Adapt a legacy (params, session_id) handler onto the context form.
+    static context_method_handler adapt_legacy(method_handler handler) {
+        return [handler = std::move(handler)](const json& params,
+                                              const request_context& ctx) -> json {
+            return handler(params, ctx.session_id);
+        };
+    }
     
     // Auxiliary function to create an async handler from a regular handler
     template<typename F>

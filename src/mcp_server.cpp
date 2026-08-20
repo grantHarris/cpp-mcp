@@ -769,8 +769,12 @@ void server::set_instructions(const std::string& instructions) {
 }
 
 void server::register_method(const std::string& method, method_handler handler) {
+    register_method(method, adapt_legacy(std::move(handler)));
+}
+
+void server::register_method(const std::string& method, context_method_handler handler) {
     std::lock_guard<std::mutex> lock(mutex_);
-    method_handlers_[method] = handler;
+    method_handlers_[method] = std::move(handler);
 }
 
 void server::register_notification(const std::string& method, notification_handler handler) {
@@ -817,7 +821,7 @@ void server::register_resource(const std::string& path, std::shared_ptr<resource
 
     // Register methods for resource access
     if (method_handlers_.find("resources/read") == method_handlers_.end()) {
-        method_handlers_["resources/read"] = [this](const json& params, const std::string& session_id) -> json {
+        method_handlers_["resources/read"] = [this](const json& params, const request_context& ctx) -> json {
             if (!params.contains("uri") || !params["uri"].is_string()) {
                 throw mcp_exception(error_code::invalid_params, "Missing or invalid 'uri' parameter");
             }
@@ -836,7 +840,7 @@ void server::register_resource(const std::string& path, std::shared_ptr<resource
             for (const auto& tmpl : resource_templates_) {
                 std::map<std::string, std::string> uri_params;
                 if (match_uri_template(tmpl.uri_template, uri, uri_params)) {
-                    json result = tmpl.handler(uri, uri_params, session_id);
+                    json result = tmpl.handler(uri, uri_params, ctx.session_id);
                     json contents = json::array();
                     contents.push_back(result);
                     return json{{"contents", contents}};
@@ -848,7 +852,7 @@ void server::register_resource(const std::string& path, std::shared_ptr<resource
     }
     
     if (method_handlers_.find("resources/list") == method_handlers_.end()) {
-        method_handlers_["resources/list"] = [this](const json& params, const std::string& session_id) -> json {
+        method_handlers_["resources/list"] = [this](const json& params, const request_context& ctx) -> json {
             // Cursor-based pagination: cursor is the index to start from
             size_t start = 0;
             size_t page_size = 1000;
@@ -874,7 +878,7 @@ void server::register_resource(const std::string& path, std::shared_ptr<resource
     }
     
     if (method_handlers_.find("resources/subscribe") == method_handlers_.end()) {
-        method_handlers_["resources/subscribe"] = [this](const json& params, const std::string& session_id) -> json {
+        method_handlers_["resources/subscribe"] = [this](const json& params, const request_context& ctx) -> json {
             if (!params.contains("uri") || !params["uri"].is_string()) {
                 throw mcp_exception(error_code::invalid_params, "Missing or invalid 'uri' parameter");
             }
@@ -890,7 +894,7 @@ void server::register_resource(const std::string& path, std::shared_ptr<resource
     }
 
     if (method_handlers_.find("resources/unsubscribe") == method_handlers_.end()) {
-        method_handlers_["resources/unsubscribe"] = [this](const json& params, const std::string& session_id) -> json {
+        method_handlers_["resources/unsubscribe"] = [this](const json& params, const request_context& ctx) -> json {
             if (!params.contains("uri") || !params["uri"].is_string()) {
                 throw mcp_exception(error_code::invalid_params, "Missing or invalid 'uri' parameter");
             }
@@ -899,7 +903,7 @@ void server::register_resource(const std::string& path, std::shared_ptr<resource
     }
 
     if (method_handlers_.find("resources/templates/list") == method_handlers_.end()) {
-        method_handlers_["resources/templates/list"] = [this](const json& params, const std::string& session_id) -> json {
+        method_handlers_["resources/templates/list"] = [this](const json& params, const request_context& ctx) -> json {
             size_t start = 0;
             size_t page_size = 1000;
             if (params.contains("cursor") && params["cursor"].is_string()) {
@@ -941,7 +945,7 @@ void server::register_resource_template(
     if (method_handlers_.find("resources/read") == method_handlers_.end()) {
         // Force registration by calling register_resource with a dummy,
         // or just register the read handler directly.
-        method_handlers_["resources/read"] = [this](const json& params, const std::string& session_id) -> json {
+        method_handlers_["resources/read"] = [this](const json& params, const request_context& ctx) -> json {
             if (!params.contains("uri") || !params["uri"].is_string()) {
                 throw mcp_exception(error_code::invalid_params, "Missing or invalid 'uri' parameter");
             }
@@ -955,7 +959,7 @@ void server::register_resource_template(
             for (const auto& tmpl : resource_templates_) {
                 std::map<std::string, std::string> uri_params;
                 if (match_uri_template(tmpl.uri_template, uri, uri_params)) {
-                    json result = tmpl.handler(uri, uri_params, session_id);
+                    json result = tmpl.handler(uri, uri_params, ctx.session_id);
                     json contents = json::array();
                     contents.push_back(result);
                     return json{{"contents", contents}};
@@ -966,7 +970,7 @@ void server::register_resource_template(
     }
 
     if (method_handlers_.find("resources/templates/list") == method_handlers_.end()) {
-        method_handlers_["resources/templates/list"] = [this](const json& params, const std::string& /*session_id*/) -> json {
+        method_handlers_["resources/templates/list"] = [this](const json& params, const request_context& /*ctx*/) -> json {
             size_t start = 0;
             size_t page_size = 1000;
             if (params.contains("cursor") && params["cursor"].is_string()) {
@@ -994,12 +998,16 @@ void server::register_resource_template(
 }
 
 void server::register_tool(const tool& tool, tool_handler handler) {
+    register_tool(tool, adapt_legacy(std::move(handler)));
+}
+
+void server::register_tool(const tool& tool, context_tool_handler handler) {
     std::lock_guard<std::mutex> lock(mutex_);
-    tools_[tool.name] = std::make_pair(tool, handler);
+    tools_[tool.name] = std::make_pair(tool, std::move(handler));
     
     // Register methods for tool listing and calling
     if (method_handlers_.find("tools/list") == method_handlers_.end()) {
-        method_handlers_["tools/list"] = [this](const json& params, const std::string& session_id) -> json {
+        method_handlers_["tools/list"] = [this](const json& params, const request_context& ctx) -> json {
             size_t start = 0;
             size_t page_size = 1000;
             if (params.contains("cursor") && params["cursor"].is_string()) {
@@ -1024,7 +1032,7 @@ void server::register_tool(const tool& tool, tool_handler handler) {
     }
     
     if (method_handlers_.find("tools/call") == method_handlers_.end()) {
-        method_handlers_["tools/call"] = [this](const json& params, const std::string& session_id) -> json {
+        method_handlers_["tools/call"] = [this](const json& params, const request_context& ctx) -> json {
             // Spec 2025-11-25 (SEP-1303): tool input-validation failures are
             // returned as CallToolResult{ isError: true, ... }, not as
             // JSON-RPC -32602 protocol errors, so the model can self-correct.
@@ -1049,7 +1057,7 @@ void server::register_tool(const tool& tool, tool_handler handler) {
 
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                auto it_session = session_clients_.find(session_id);
+                auto it_session = session_clients_.find(ctx.session_id);
                 if (it_session != session_clients_.end()) {
                     ++it_session->second.tool_call_count;
                 }
@@ -1081,7 +1089,7 @@ void server::register_tool(const tool& tool, tool_handler handler) {
 
             json tool_result = {{"isError", false}};
             try {
-                tool_result["content"] = it->second.second(tool_args, session_id);
+                tool_result["content"] = it->second.second(tool_args, ctx);
             } catch (const mcp_exception& e) {
                 tool_result["isError"] = true;
                 tool_result["content"] = json::array({
@@ -1103,11 +1111,15 @@ void server::register_tool(const tool& tool, tool_handler handler) {
 }
 
 void server::register_prompt(const prompt& prompt, prompt_handler handler) {
+    register_prompt(prompt, adapt_legacy(std::move(handler)));
+}
+
+void server::register_prompt(const prompt& prompt, context_prompt_handler handler) {
     std::lock_guard<std::mutex> lock(mutex_);
-    prompts_[prompt.name] = std::make_pair(prompt, handler);
+    prompts_[prompt.name] = std::make_pair(prompt, std::move(handler));
 
     if (method_handlers_.find("prompts/list") == method_handlers_.end()) {
-        method_handlers_["prompts/list"] = [this](const json& params, const std::string& session_id) -> json {
+        method_handlers_["prompts/list"] = [this](const json& params, const request_context& ctx) -> json {
             size_t start = 0;
             size_t page_size = 1000;
             if (params.contains("cursor") && params["cursor"].is_string()) {
@@ -1132,7 +1144,7 @@ void server::register_prompt(const prompt& prompt, prompt_handler handler) {
     }
 
     if (method_handlers_.find("prompts/get") == method_handlers_.end()) {
-        method_handlers_["prompts/get"] = [this](const json& params, const std::string& session_id) -> json {
+        method_handlers_["prompts/get"] = [this](const json& params, const request_context& ctx) -> json {
             if (!params.contains("name") || !params["name"].is_string()) {
                 throw mcp_exception(error_code::invalid_params, "Missing or invalid 'name' parameter");
             }
@@ -1144,7 +1156,7 @@ void server::register_prompt(const prompt& prompt, prompt_handler handler) {
             }
 
             json arguments = params.contains("arguments") ? params["arguments"] : json::object();
-            json result = it->second.second(arguments, session_id);
+            json result = it->second.second(arguments, ctx);
 
             // Ensure the result contains description
             if (!result.contains("description")) {
@@ -2039,7 +2051,7 @@ json server::process_request(const request& req,
         }
         
         // Find registered method handler
-        method_handler handler;
+        context_method_handler handler;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto it = method_handlers_.find(req.method);
@@ -2051,7 +2063,7 @@ json server::process_request(const request& req,
         if (handler) {
             // Call handler
             LOG_INFO("Calling method handler: ", req.method);            
-            json result = handler(req.params, session_id);
+            json result = handler(req.params, make_request_context(req, session_id, remote_addr));
             
             // Create success response
             LOG_INFO("Method call successful: ", req.method);
@@ -2156,6 +2168,7 @@ json server::handle_initialize(const request& req,
         info.client_version = client_version;
         info.remote_addr = remote_addr;
         info.protocol_version = negotiated_version;
+        info.client_capabilities = params.value("capabilities", json::object());
         info.connected_at_unix = unix_now();
         info.last_seen_unix = info.connected_at_unix;
     }
@@ -2331,6 +2344,54 @@ bool server::is_cancelled(const json& request_id, const std::string& session_id)
     auto it = cancelled_requests_.find(session_id);
     if (it == cancelled_requests_.end()) return false;
     return it->second.count(request_id.dump()) > 0;
+}
+
+void server::send_log(const request_context& ctx, const std::string& level,
+                      const std::string& logger, const json& data) {
+    send_log(ctx.session_id, level, logger, data);
+}
+
+void server::send_progress(const request_context& ctx, const json& progress_token,
+                           double progress, double total, const std::string& message) {
+    send_progress(ctx.session_id, progress_token, progress, total, message);
+}
+
+bool server::is_cancelled(const request_context& ctx) const {
+    return is_cancelled(ctx.request_id, ctx.session_id);
+}
+
+bool server::is_session_alive(const std::string& session_id) const {
+    if (session_id.empty()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    return session_clients_.count(session_id) > 0;
+}
+
+request_context server::make_request_context(const request& req,
+                                             const std::string& session_id,
+                                             const std::string& remote_addr) const {
+    request_context ctx;
+    ctx.session_id = session_id;
+    ctx.remote_addr = remote_addr;
+    ctx.request_id = req.id;
+    if (req.params.is_object() && req.params.contains("_meta") && req.params["_meta"].is_object()) {
+        ctx.meta = req.params["_meta"];
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto client = session_clients_.find(session_id);
+    if (client != session_clients_.end()) {
+        ctx.protocol_version = client->second.protocol_version;
+        ctx.client_name = client->second.client_name;
+        ctx.client_version = client->second.client_version;
+        ctx.client_capabilities = client->second.client_capabilities;
+    }
+    auto level = session_log_levels_.find(session_id);
+    if (level != session_log_levels_.end()) {
+        ctx.log_level = level->second;
+    }
+    return ctx;
 }
 
 std::string server::session_protocol_version(const std::string& session_id) const {
