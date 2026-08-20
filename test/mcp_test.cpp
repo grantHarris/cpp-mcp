@@ -1944,3 +1944,131 @@ TEST_F(ServerTest, SessionsAreTrackedIndependently) {
     EXPECT_EQ(1u, ids.count(sid_a));
     EXPECT_EQ(1u, ids.count(sid_b));
 }
+
+// ===========================================================================
+// request_context: handlers that take a context instead of a session id
+// ===========================================================================
+
+TEST_F(ServerTest, ContextToolSeesSessionIdentityAndMeta) {
+    request_context seen;
+    auto probe = tool_builder("probe").with_description("Probe").build();
+    srv_->register_tool(probe, [&seen](const json&, const request_context& ctx) -> json {
+        seen = ctx;
+        return json::array({{{"type", "text"}, {"text", "ok"}}});
+    });
+
+    auto [sid, _] = mcp_initialize(*cli_);
+    json req = {{"jsonrpc", "2.0"}, {"id", 7}, {"method", "tools/call"},
+                {"params", {{"name", "probe"},
+                            {"arguments", json::object()},
+                            {"_meta", {{"progressToken", "tok-1"}}}}}};
+    auto res = mcp_post(*cli_, "/mcp", req, sid);
+    ASSERT_FALSE(res["_body"]["result"]["isError"].get<bool>());
+
+    EXPECT_EQ(seen.session_id, sid);
+    EXPECT_TRUE(seen.has_session());
+    EXPECT_EQ(seen.protocol_version, MCP_VERSION);
+    EXPECT_EQ(seen.client_name, "TestClient");
+    EXPECT_EQ(seen.client_version, "1.0.0");
+    EXPECT_TRUE(seen.client_capabilities.is_object());
+    EXPECT_EQ(seen.log_level, "warning");
+    EXPECT_EQ(seen.request_id, 7);
+    EXPECT_EQ(seen.meta["progressToken"], "tok-1");
+    EXPECT_FALSE(seen.remote_addr.empty());
+}
+
+TEST_F(ServerTest, ContextReflectsPerSessionLogLevel) {
+    std::string seen_level;
+    auto probe = tool_builder("probe").with_description("Probe").build();
+    srv_->register_tool(probe, [&seen_level](const json&, const request_context& ctx) -> json {
+        seen_level = ctx.log_level;
+        return json::array();
+    });
+
+    auto [sid, _] = mcp_initialize(*cli_);
+    json set_level = {{"jsonrpc", "2.0"}, {"id", 2}, {"method", "logging/setLevel"},
+                      {"params", {{"level", "debug"}}}};
+    mcp_post(*cli_, "/mcp", set_level, sid);
+    json req = {{"jsonrpc", "2.0"}, {"id", 3}, {"method", "tools/call"},
+                {"params", {{"name", "probe"}}}};
+    mcp_post(*cli_, "/mcp", req, sid);
+    EXPECT_EQ(seen_level, "debug");
+}
+
+TEST_F(ServerTest, LegacyAndContextHandlersCoexist) {
+    auto legacy = tool_builder("legacy").with_description("Legacy").build();
+    srv_->register_tool(legacy, [](const json&, const std::string& sid) -> json {
+        return json::array({{{"type", "text"}, {"text", sid}}});
+    });
+    auto modern = tool_builder("modern").with_description("Modern").build();
+    srv_->register_tool(modern, [](const json&, const request_context& ctx) -> json {
+        return json::array({{{"type", "text"}, {"text", ctx.session_id}}});
+    });
+
+    auto [sid, _] = mcp_initialize(*cli_);
+    for (const char* name : {"legacy", "modern"}) {
+        json req = {{"jsonrpc", "2.0"}, {"id", 4}, {"method", "tools/call"},
+                    {"params", {{"name", name}}}};
+        auto res = mcp_post(*cli_, "/mcp", req, sid);
+        EXPECT_EQ(res["_body"]["result"]["content"][0]["text"], sid) << name;
+    }
+}
+
+TEST_F(ServerTest, ContextMethodAndPromptHandlers) {
+    srv_->register_method("custom/whoami", [](const json&, const request_context& ctx) -> json {
+        return {{"client", ctx.client_name}};
+    });
+    prompt p;
+    p.name = "ctx_prompt";
+    srv_->register_prompt(p, [](const json&, const request_context& ctx) -> json {
+        return {{"messages", json::array({{{"role", "user"},
+                 {"content", {{"type", "text"}, {"text", ctx.client_version}}}}})}};
+    });
+
+    auto [sid, _] = mcp_initialize(*cli_);
+    json who = {{"jsonrpc", "2.0"}, {"id", 5}, {"method", "custom/whoami"}, {"params", json::object()}};
+    EXPECT_EQ(mcp_post(*cli_, "/mcp", who, sid)["_body"]["result"]["client"], "TestClient");
+
+    json get = {{"jsonrpc", "2.0"}, {"id", 6}, {"method", "prompts/get"},
+                {"params", {{"name", "ctx_prompt"}}}};
+    auto res = mcp_post(*cli_, "/mcp", get, sid);
+    EXPECT_EQ(res["_body"]["result"]["messages"][0]["content"]["text"], "1.0.0");
+}
+
+TEST_F(ServerTest, IsSessionAliveTracksLifecycle) {
+    EXPECT_FALSE(srv_->is_session_alive(""));
+    EXPECT_FALSE(srv_->is_session_alive("nope"));
+    auto [sid, _] = mcp_initialize(*cli_);
+    EXPECT_TRUE(srv_->is_session_alive(sid));
+
+    httplib::Headers headers = {{"Mcp-Session-Id", sid}};
+    cli_->Delete("/mcp", headers);
+    EXPECT_FALSE(srv_->is_session_alive(sid));
+}
+
+TEST_F(ServerTest, ContextSendHelpersRouteToSession) {
+    // send_log / send_progress / is_cancelled on a context must behave exactly
+    // like the session-id forms. Cancellation is the observable one without a
+    // live stream: mark the request cancelled, then ask via the context.
+    request_context seen;
+    auto probe = tool_builder("probe").with_description("Probe").build();
+    srv_->register_tool(probe, [&seen, this](const json&, const request_context& ctx) -> json {
+        seen = ctx;
+        // Must not throw for a session with no open stream
+        srv_->send_log(ctx, "error", "test", {{"k", 1}});
+        srv_->send_progress(ctx, "tok", 0.5, 1.0);
+        return json::array();
+    });
+
+    auto [sid, _] = mcp_initialize(*cli_);
+    json req = {{"jsonrpc", "2.0"}, {"id", 9}, {"method", "tools/call"},
+                {"params", {{"name", "probe"}}}};
+    mcp_post(*cli_, "/mcp", req, sid);
+    EXPECT_FALSE(srv_->is_cancelled(seen));
+
+    json cancel = {{"jsonrpc", "2.0"}, {"method", "notifications/cancelled"},
+                   {"params", {{"requestId", 9}}}};
+    mcp_post(*cli_, "/mcp", cancel, sid);
+    EXPECT_TRUE(srv_->is_cancelled(seen));
+    EXPECT_EQ(srv_->is_cancelled(seen), srv_->is_cancelled(json(9), sid));
+}
