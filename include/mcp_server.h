@@ -18,6 +18,7 @@
 // Include the HTTP library
 #include "httplib.h"
 
+#include <algorithm>
 #include <string>
 #include <map>
 #include <set>
@@ -33,6 +34,11 @@
 #include <deque>
 #include <optional>
 #include <utility>
+
+// How often a waiting SSE stream checks whether its client has gone away.
+#ifndef MCP_SSE_PEER_CHECK_MS
+#define MCP_SSE_PEER_CHECK_MS 250
+#endif
 
 
 namespace mcp {
@@ -166,9 +172,35 @@ public:
             // the consumer waited forever for a value that would never come,
             // while the second message also overwrote the first in the
             // single-slot message_ buffer (so the first event was lost).
-            bool result = cv_.wait_for(lk, timeout, [this] {
-                return !queue_.empty() || closed_.load(std::memory_order_acquire);
-            });
+            // Wait in short slices and check the peer between them. A client
+            // that disconnects is otherwise noticed only by the next write
+            // (the ~5 s heartbeat), and until then its session holds one of
+            // the max_sessions slots, so a few reconnecting clients can lock
+            // everyone else out with 503s.
+            const auto deadline = std::chrono::steady_clock::now() + timeout;
+            bool result = false;
+            while (true) {
+                const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - std::chrono::steady_clock::now());
+                const auto slice = std::min(
+                    remaining, std::chrono::milliseconds(MCP_SSE_PEER_CHECK_MS));
+                result = cv_.wait_for(lk, std::max(slice, std::chrono::milliseconds(0)), [this] {
+                    return !queue_.empty() || closed_.load(std::memory_order_acquire);
+                });
+                if (result || closed_.load(std::memory_order_acquire) ||
+                    std::chrono::steady_clock::now() >= deadline) {
+                    break;
+                }
+                if (sink->is_writable) {
+                    lk.unlock();
+                    const bool alive = sink->is_writable();
+                    lk.lock();
+                    if (!alive) {
+                        close();
+                        return false;
+                    }
+                }
+            }
 
             if (closed_.load(std::memory_order_acquire)) {
                 return false;
