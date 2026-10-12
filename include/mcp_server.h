@@ -152,7 +152,10 @@ public:
         close();
     }
 
-    bool wait_event(httplib::DataSink* sink, const std::chrono::milliseconds& timeout = std::chrono::milliseconds(MCP_SSE_KEEPALIVE_MS)) {
+    bool wait_event(
+        httplib::DataSink* sink,
+        const std::chrono::milliseconds& timeout = std::chrono::milliseconds(MCP_SSE_KEEPALIVE_MS),
+        bool close_on_disconnect = true) {
         if (!sink || closed_.load(std::memory_order_acquire)) {
             return false;
         }
@@ -196,7 +199,9 @@ public:
                     const bool alive = sink->is_writable();
                     lk.lock();
                     if (!alive) {
-                        close_locked();
+                        if (close_on_disconnect) {
+                            close_locked();
+                        }
                         return false;
                     }
                 }
@@ -211,11 +216,15 @@ public:
                 // connections and keep intermediaries from closing the stream.
                 try {
                     if (!sink->write(":\n\n", 3)) {
-                        close_locked();
+                        if (close_on_disconnect) {
+                            close_locked();
+                        }
                         return false;
                     }
                 } catch (...) {
-                    close_locked();
+                    if (close_on_disconnect) {
+                        close_locked();
+                    }
                     return false;
                 }
                 return true;
@@ -236,13 +245,17 @@ public:
         try {
             if (!message_copy.empty()) {
                 if (!sink->write(message_copy.data(), message_copy.size())) {
-                    close();
+                    if (close_on_disconnect) {
+                        close();
+                    }
                     return false;
                 }
             }
             return true;
         } catch (...) {
-            close();
+            if (close_on_disconnect) {
+                close();
+            }
             return false;
         }
     }
@@ -451,7 +464,9 @@ public:
     bool start(bool blocking = true);
     
     /**
-     * @brief Stop the server
+     * @brief Stop the server. Calls from host callbacks request shutdown and
+     * return without waiting for that callback's own worker to exit. Calls
+     * from other threads wait until callbacks and session cleanup finish.
      */
     void stop();
     
@@ -689,6 +704,10 @@ private:
     };
     std::map<std::string, sse_thread> sse_threads_;
     std::atomic<bool> stop_in_progress_{false};
+    std::mutex stop_mutex_;
+    std::condition_variable stop_cv_;
+    std::thread deferred_stop_thread_;
+    void stop_impl();
     void reap_finished_sse_threads();
     friend struct server_test_access;
 
@@ -880,7 +899,7 @@ private:
     std::map<std::string, session_open_handler> session_open_handler_;
 
     // Close session
-    void close_session(const std::string& session_id);
+    void close_session(const std::string& session_id, bool force = false);
 };
 
 } // namespace mcp
