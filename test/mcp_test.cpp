@@ -1872,6 +1872,11 @@ TEST_F(ServerTest, CleanupHandlersReceiveOnlyTheClosingSessionId) {
     const auto remaining = srv_->get_sessions();
     ASSERT_EQ(1u, remaining.size());
     EXPECT_EQ(sid_b, remaining.front().session_id);
+    auto deleted_b = cli_->Delete("/mcp", {{"Mcp-Session-Id", sid_b}});
+    ASSERT_TRUE(deleted_b);
+    EXPECT_EQ(200, deleted_b->status);
+    EXPECT_EQ((std::vector<std::string>{sid_a, sid_b}), first_seen);
+    EXPECT_EQ(first_seen, second_seen);
 }
 
 // Re-registering under the same key replaces, matching register_session_cleanup.

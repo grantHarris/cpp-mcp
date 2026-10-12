@@ -196,7 +196,7 @@ public:
                     const bool alive = sink->is_writable();
                     lk.lock();
                     if (!alive) {
-                        close();
+                        close_locked();
                         return false;
                     }
                 }
@@ -211,11 +211,11 @@ public:
                 // connections and keep intermediaries from closing the stream.
                 try {
                     if (!sink->write(":\n\n", 3)) {
-                        close();
+                        close_locked();
                         return false;
                     }
                 } catch (...) {
-                    close();
+                    close_locked();
                     return false;
                 }
                 return true;
@@ -281,18 +281,12 @@ public:
     }
     
     void close() {
-        bool was_closed = closed_.exchange(true, std::memory_order_release);
-        if (was_closed) {
-            return;
-        }
-        
-        try {
-            cv_.notify_all();
-        } catch (...) {
-            // Ignore exceptions
-        }
+        // Change the predicate under the waiter's mutex to avoid a lost wakeup
+        // between checking closed_ and entering condition_variable::wait.
+        std::lock_guard<std::mutex> lock(m_);
+        close_locked();
     }
-    
+
     bool is_closed() const {
         return closed_.load(std::memory_order_acquire);
     }
@@ -319,6 +313,11 @@ public:
     }
 
 private:
+    void close_locked() {
+        if (!closed_.exchange(true, std::memory_order_release)) {
+            cv_.notify_all();
+        }
+    }
     mutable std::mutex m_;
     std::condition_variable cv_;
     std::deque<std::string> queue_;
@@ -682,8 +681,16 @@ private:
     // Server thread (for non-blocking mode)
     std::unique_ptr<std::thread> server_thread_;
 
-    // SSE thread
-    std::map<std::string, std::unique_ptr<std::thread>> sse_threads_;
+    // Completion is published only after a heartbeat stops accessing session
+    // state. Finished threads can then be joined outside mutex_.
+    struct sse_thread {
+        std::unique_ptr<std::thread> worker;
+        std::shared_future<void> finished;
+    };
+    std::map<std::string, sse_thread> sse_threads_;
+    std::atomic<bool> stop_in_progress_{false};
+    void reap_finished_sse_threads();
+    friend struct server_test_access;
 
     // Event dispatcher for server-sent events
     event_dispatcher sse_dispatcher_;

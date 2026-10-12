@@ -24,13 +24,19 @@ bool file_exists(const std::string& path)
     return ::stat(path.c_str(), &st) == 0;
 }
 
-time_t file_last_write_time(const std::string& path)
+std::pair<time_t, long> file_last_write_time(const std::string& path)
 {
     struct stat st;
     if (::stat(path.c_str(), &st) != 0) {
-        return 0;
+        return {0, 0};
     }
-    return st.st_mtime;
+#if defined(__APPLE__)
+    return {st.st_mtimespec.tv_sec, st.st_mtimespec.tv_nsec};
+#elif defined(_WIN32)
+    return {st.st_mtime, 0};
+#else
+    return {st.st_mtim.tv_sec, st.st_mtim.tv_nsec};
+#endif
 }
 
 std::string path_filename(const std::string& path)
@@ -157,7 +163,7 @@ file_resource::file_resource(const std::string& file_path,
                    mime_type.empty() ? guess_mime_type(file_path) : mime_type,
                    description),
       file_path_(file_path),
-      last_modified_(0) {
+      last_modified_{0, 0} {
     
     // Check if file exists
     if (!file_exists(file_path_)) {
@@ -198,7 +204,7 @@ bool file_resource::is_modified() const {
         return true; // File was deleted
     }
 
-    time_t current_modified = file_last_write_time(file_path_);
+    const auto current_modified = file_last_write_time(file_path_);
     return current_modified != last_modified_;
 }
 
