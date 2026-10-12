@@ -112,6 +112,27 @@ bool schema_type_matches(const std::string& type, const mcp::json& value) {
     return false;
 }
 
+bool validate_size_constraint(const mcp::json& schema, const char* keyword,
+                              size_t actual, bool minimum, const std::string& path,
+                              const char* failure, std::string& error) {
+    if (!schema.contains(keyword)) {
+        return true;
+    }
+    const auto& bound = schema[keyword];
+    if ((!bound.is_number_integer() && !bound.is_number_unsigned()) ||
+        (!bound.is_number_unsigned() && bound.get<int64_t>() < 0)) {
+        error = path + " has invalid " + keyword + " schema";
+        return false;
+    }
+    const uint64_t limit = bound.get<uint64_t>();
+    if (minimum ? static_cast<uint64_t>(actual) < limit
+                : static_cast<uint64_t>(actual) > limit) {
+        error = path + failure;
+        return false;
+    }
+    return true;
+}
+
 bool validate_schema_combinators(const mcp::json& schema,
                                  const mcp::json& value,
                                  const std::string& path,
@@ -185,14 +206,10 @@ bool validate_object_schema(const mcp::json& schema,
         return false;
     }
 
-    if (schema.contains("minProperties") && schema["minProperties"].is_number_unsigned() &&
-        value.size() < schema["minProperties"].get<size_t>()) {
-        error = path + " has too few properties";
-        return false;
-    }
-    if (schema.contains("maxProperties") && schema["maxProperties"].is_number_unsigned() &&
-        value.size() > schema["maxProperties"].get<size_t>()) {
-        error = path + " has too many properties";
+    if (!validate_size_constraint(schema, "minProperties", value.size(), true, path,
+                                  " has too few properties", error) ||
+        !validate_size_constraint(schema, "maxProperties", value.size(), false, path,
+                                  " has too many properties", error)) {
         return false;
     }
 
@@ -344,14 +361,10 @@ bool validate_schema_type(const mcp::json& schema,
     }
 
     if (value.is_array()) {
-        if (schema.contains("minItems") && schema["minItems"].is_number_unsigned() &&
-            value.size() < schema["minItems"].get<size_t>()) {
-            error = path + " has too few items";
-            return false;
-        }
-        if (schema.contains("maxItems") && schema["maxItems"].is_number_unsigned() &&
-            value.size() > schema["maxItems"].get<size_t>()) {
-            error = path + " has too many items";
+        if (!validate_size_constraint(schema, "minItems", value.size(), true, path,
+                                      " has too few items", error) ||
+            !validate_size_constraint(schema, "maxItems", value.size(), false, path,
+                                      " has too many items", error)) {
             return false;
         }
         if (schema.contains("uniqueItems") && !schema["uniqueItems"].is_boolean()) {
@@ -382,14 +395,10 @@ bool validate_schema_type(const mcp::json& schema,
     if (value.is_string()) {
         const auto string_value = value.get<std::string>();
         const size_t length = utf8_code_point_count(string_value);
-        if (schema.contains("minLength") && schema["minLength"].is_number_unsigned() &&
-            length < schema["minLength"].get<size_t>()) {
-            error = path + " is too short";
-            return false;
-        }
-        if (schema.contains("maxLength") && schema["maxLength"].is_number_unsigned() &&
-            length > schema["maxLength"].get<size_t>()) {
-            error = path + " is too long";
+        if (!validate_size_constraint(schema, "minLength", length, true, path,
+                                      " is too short", error) ||
+            !validate_size_constraint(schema, "maxLength", length, false, path,
+                                      " is too long", error)) {
             return false;
         }
         if (schema.contains("pattern")) {
@@ -458,6 +467,15 @@ bool validate_tool_arguments(const mcp::json& schema,
                              std::string& error) {
     return validate_schema_type(schema, args, "arguments", error);
 }
+
+thread_local const mcp::server* callback_server = nullptr;
+struct callback_scope {
+    const mcp::server* previous;
+    explicit callback_scope(const mcp::server* current) : previous(callback_server) {
+        callback_server = current;
+    }
+    ~callback_scope() { callback_server = previous; }
+};
 } // anonymous namespace
 
 namespace mcp {
@@ -671,15 +689,45 @@ bool server::start(bool blocking) {
 }
 
 void server::stop() {
-    // Cleanup handlers may re-enter stop(). Only the outer call owns joining.
-    if (stop_in_progress_.exchange(true)) {
+    std::unique_lock<std::mutex> lock(stop_mutex_);
+    if (callback_server == this) {
+        // A callback can run on an HTTP, heartbeat, maintenance, or legacy
+        // pool worker. Joining those workers here would join ourselves.
+        if (stop_in_progress_) {
+            return;
+        }
+        if (deferred_stop_thread_.joinable()) {
+            deferred_stop_thread_.join();
+        }
+        stop_in_progress_ = true;
+        deferred_stop_thread_ = std::thread([this] {
+            stop_impl();
+            {
+                std::lock_guard<std::mutex> done(stop_mutex_);
+                stop_in_progress_ = false;
+            }
+            stop_cv_.notify_all();
+        });
         return;
     }
-    struct stop_guard {
-        std::atomic<bool>& flag;
-        ~stop_guard() { flag.store(false); }
-    } guard{stop_in_progress_};
 
+    stop_cv_.wait(lock, [this] { return !stop_in_progress_; });
+    if (deferred_stop_thread_.joinable()) {
+        std::thread finished = std::move(deferred_stop_thread_);
+        lock.unlock();
+        finished.join();
+        lock.lock();
+    }
+    stop_in_progress_ = true;
+    lock.unlock();
+    stop_impl();
+    lock.lock();
+    stop_in_progress_ = false;
+    lock.unlock();
+    stop_cv_.notify_all();
+}
+
+void server::stop_impl() {
     // Admission checks and publishing new sessions use this same mutex.
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -688,17 +736,17 @@ void server::stop() {
     http_server_->stop();
     stop_maintenance_thread();
 
-    std::vector<std::string> sessions;
+    std::vector<std::shared_ptr<event_dispatcher>> dispatchers;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         for (const auto& entry : session_dispatchers_) {
-            sessions.push_back(entry.first);
+            dispatchers.push_back(entry.second);
         }
     }
-    // close_session owns exactly-once state removal and invokes host hooks
-    // outside mutex_, preserving the closing session ID as the argument.
-    for (const auto& session_id : sessions) {
-        close_session(session_id);
+    // Wake stream workers now. Session state and cleanup handlers must remain
+    // alive until all accepted legacy callback work has finished.
+    for (const auto& dispatcher : dispatchers) {
+        dispatcher->close();
     }
 
     // The HTTP listener joins its request workers. Admission is already shut
@@ -716,6 +764,19 @@ void server::stop() {
         if (entry.second.worker && entry.second.worker->joinable()) {
             entry.second.worker->join();
         }
+    }
+
+    thread_pool_.wait_idle();
+
+    std::vector<std::string> sessions;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& entry : session_dispatchers_) {
+            sessions.push_back(entry.first);
+        }
+    }
+    for (const auto& session_id : sessions) {
+        close_session(session_id, true);
     }
     LOG_INFO("MCP server stopped");
 }
@@ -1541,8 +1602,10 @@ auth_result server::authorize_request(const httplib::Request& req,
 
     try {
         if (detailed_handler) {
+            callback_scope scope(this);
             return detailed_handler(token, session_id);
         }
+        callback_scope scope(this);
         if (!handler(token, session_id)) {
             return auth_result::reject();
         }
@@ -1897,7 +1960,8 @@ void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res)
                 }
 
                 dispatcher->update_activity();
-                bool result = dispatcher->wait_event(&sink);
+                bool result = dispatcher->wait_event(&sink,
+                    std::chrono::milliseconds(MCP_SSE_KEEPALIVE_MS), false);
                 if (!result) {
                     return false;
                 }
@@ -1960,6 +2024,7 @@ void server::handle_mcp_delete(const httplib::Request& req, httplib::Response& r
 json server::process_request(const request& req,
                              const std::string& session_id,
                              const std::string& remote_addr) {
+    callback_scope scope(this);
     // Check if it is a notification
     if (req.is_notification()) {
         if (req.method == "notifications/initialized") {
@@ -2090,6 +2155,7 @@ json server::process_request(const request& req,
 json server::handle_initialize(const request& req,
                                const std::string& session_id,
                                const std::string& remote_addr) {
+    callback_scope scope(this);
     const json& params = req.params;
 
     // Version negotiation
@@ -2497,7 +2563,7 @@ bool server::set_mount_point(const std::string& mount_point, const std::string& 
     return http_server_->set_mount_point(mount_point, dir, headers);
 }
 
-void server::close_session(const std::string& session_id) {
+void server::close_session(const std::string& session_id, bool force) {
     // Snapshot state under lock. Idempotent: second concurrent caller finds
     // nothing to clean up and returns silently. Thread ownership stays in
     // sse_threads_ so server::stop() can join on shutdown.
@@ -2506,6 +2572,12 @@ void server::close_session(const std::string& session_id) {
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
+
+        // Shutdown closes transports first and drains accepted callbacks
+        // before releasing their session state and host-owned cleanup hooks.
+        if (!force && !running_) {
+            return;
+        }
 
         auto dispatcher_it = session_dispatchers_.find(session_id);
         if (dispatcher_it == session_dispatchers_.end()) {
@@ -2535,6 +2607,7 @@ void server::close_session(const std::string& session_id) {
     // work including callbacks that re-enter the server; holding mutex_
     // would deadlock.
     try {
+        callback_scope scope(this);
         for (const auto& [key, handler] : cleanup_handlers_copy) {
             (void)key;
             try {

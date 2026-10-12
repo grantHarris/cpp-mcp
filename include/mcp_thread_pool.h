@@ -49,9 +49,17 @@ public:
                         
                         task = std::move(tasks_.front());
                         tasks_.pop();
+                        ++active_tasks_;
                     }
                     
                     task();
+                    {
+                        std::lock_guard<std::mutex> lock(queue_mutex_);
+                        --active_tasks_;
+                        if (tasks_.empty() && active_tasks_ == 0) {
+                            idle_condition_.notify_all();
+                        }
+                    }
                 }
             });
         }
@@ -73,6 +81,15 @@ public:
                 worker.join();
             }
         }
+    }
+
+    // Wait for all accepted tasks, including queued tasks, to finish. Callers
+    // must first stop submitting work and must not be one of this pool's workers.
+    void wait_idle() {
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        idle_condition_.wait(lock, [this] {
+            return tasks_.empty() && active_tasks_ == 0;
+        });
     }
     
     /**
@@ -122,6 +139,8 @@ private:
     // Mutex and condition variable
     std::mutex queue_mutex_;
     std::condition_variable condition_;
+    std::condition_variable idle_condition_;
+    size_t active_tasks_ = 0;
     
     // Stop flag
     std::atomic<bool> stop_;
