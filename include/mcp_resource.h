@@ -16,6 +16,8 @@
 #include <memory>
 #include <functional>
 #include <map>
+#include <ctime>
+#include <utility>
 
 namespace mcp {
 
@@ -220,7 +222,7 @@ public:
 
 private:
     std::string file_path_;
-    mutable time_t last_modified_;
+    mutable std::pair<time_t, long> last_modified_;
     
     /**
      * @brief Guess the MIME type from file extension

@@ -544,6 +544,9 @@ server::~server() {
 
 
 bool server::start(bool blocking) {
+    if (stop_in_progress_) {
+        return false;
+    }
     if (running_) {
         return true;  // Already running
     }
@@ -654,98 +657,88 @@ bool server::start(bool blocking) {
             LOG_INFO("Serving on ", host_, ":", port_);
             if (!http_server_->listen_after_bind()) {
                 LOG_ERROR("Accept loop ended unexpectedly on ", host_, ":", port_);
+                http_server_->decommission();
                 running_ = false;
                 stop_maintenance_thread();
             }
         });
-        return true;
+        // httplib::stop() only closes a running accept loop. A successful bind
+        // alone is insufficient: an immediate stop could otherwise happen
+        // before listen_after_bind sets its running flag, and then join forever.
+        http_server_->wait_until_ready();
+        return running_;
     }
 }
 
 void server::stop() {
-    // running_ being false is not proof there is nothing to tear down. A failed
-    // listen() clears it from the listener thread while server_thread_ is still
-    // joinable, and ~unique_ptr<std::thread> on a joinable thread calls
-    // std::terminate -- so returning early here aborted the whole host process
-    // on the one path that matters: another process already holding the port.
-    // Bail only when there is genuinely nothing left to join.
-    const bool was_running = running_.exchange(false);
-    if (!was_running && !(server_thread_ && server_thread_->joinable())) {
+    // Cleanup handlers may re-enter stop(). Only the outer call owns joining.
+    if (stop_in_progress_.exchange(true)) {
         return;
     }
+    struct stop_guard {
+        std::atomic<bool>& flag;
+        ~stop_guard() { flag.store(false); }
+    } guard{stop_in_progress_};
 
-    LOG_INFO("Stopping MCP server on ", host_, ":", port_);
-
-    stop_maintenance_thread();
-    
-    // Copy all dispatchers and threads to avoid holding the lock for too long
-    std::vector<std::shared_ptr<event_dispatcher>> dispatchers_to_close;
-    std::vector<std::unique_ptr<std::thread>> threads_to_join;
-
+    // Admission checks and publishing new sessions use this same mutex.
     {
         std::lock_guard<std::mutex> lock(mutex_);
-
-        // Copy all dispatchers
-        dispatchers_to_close.reserve(session_dispatchers_.size());
-        for (const auto& [_, dispatcher] : session_dispatchers_) {
-            dispatchers_to_close.push_back(dispatcher);
-        }
-
-        // Copy all threads
-        threads_to_join.reserve(sse_threads_.size());
-        for (auto& [_, thread] : sse_threads_) {
-            if (thread && thread->joinable()) {
-                threads_to_join.push_back(std::move(thread));
-            }
-        }
-
-        // Clear the maps
-        session_dispatchers_.clear();
-        sse_threads_.clear();
-        session_initialized_.clear();
-        session_protocol_versions_.clear();
-        session_log_levels_.clear();
-        cancelled_requests_.clear();
+        running_ = false;
     }
+    http_server_->stop();
+    stop_maintenance_thread();
 
-    // Close all copied dispatchers so any threads waiting in wait_event()
-    // wake up immediately instead of blocking on the keepalive timeout.
-    for (auto& dispatcher : dispatchers_to_close) {
-        if (dispatcher) {
-            dispatcher->close();
+    std::vector<std::string> sessions;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& entry : session_dispatchers_) {
+            sessions.push_back(entry.first);
         }
     }
-
-    // Give threads some time to handle close events
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    
-    // Join all SSE threads unconditionally. We already closed their dispatchers
-    // above, which wakes them from wait_event / wait_for_close immediately,
-    // so join should complete within milliseconds. Detach is never safe here
-    // because the threads access server state (e.g. via close_session) and
-    // would cause use-after-free if they outlive the server.
-    for (auto& thread : threads_to_join) {
-        if (thread && thread->joinable()) {
-            try {
-                thread->join();
-            } catch (const std::exception& e) {
-                LOG_ERROR("Failed to join SSE thread: ", e.what());
-            }
-        }
+    // close_session owns exactly-once state removal and invokes host hooks
+    // outside mutex_, preserving the closing session ID as the argument.
+    for (const auto& session_id : sessions) {
+        close_session(session_id);
     }
 
+    // The HTTP listener joins its request workers. Admission is already shut
+    // down, and closing dispatchers wakes workers serving SSE responses.
     if (server_thread_ && server_thread_->joinable()) {
-        http_server_->stop();
-        try {
-            server_thread_->join();
-        } catch (const std::exception& e) {
-            LOG_ERROR("Failed to join server thread: ", e.what());
-        }
-    } else {
-        http_server_->stop();
+        server_thread_->join();
     }
-    
+
+    std::map<std::string, sse_thread> threads;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        threads.swap(sse_threads_);
+    }
+    for (auto& entry : threads) {
+        if (entry.second.worker && entry.second.worker->joinable()) {
+            entry.second.worker->join();
+        }
+    }
     LOG_INFO("MCP server stopped");
+}
+
+void server::reap_finished_sse_threads() {
+    std::vector<std::unique_ptr<std::thread>> finished;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto it = sse_threads_.begin(); it != sse_threads_.end();) {
+            if (it->second.finished.wait_for(std::chrono::seconds(0)) ==
+                std::future_status::ready) {
+                finished.push_back(std::move(it->second.worker));
+                it = sse_threads_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (auto& thread : finished) {
+        if (thread && thread->joinable()) {
+            thread->join();
+        }
+    }
 }
 
 bool server::is_running() const {
@@ -1227,16 +1220,7 @@ void server::handle_sse(const httplib::Request& req, httplib::Response& res) {
         return;
     }
 
-    // Enforce session limit
-    if (max_sessions_ > 0) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (session_dispatchers_.size() >= max_sessions_) {
-            LOG_WARNING("Max sessions reached (", max_sessions_, "), rejecting SSE connection");
-            res.status = 503;
-            res.set_content("{\"error\":\"Too many sessions\"}", "application/json");
-            return;
-        }
-    }
+    reap_finished_sse_threads();
 
     std::string session_id = generate_session_id();
     std::string session_uri = msg_endpoint_ + "?session_id=" + session_id;
@@ -1252,69 +1236,74 @@ void server::handle_sse(const httplib::Request& req, httplib::Response& res) {
     // Initialize activity time
     session_dispatcher->update_activity();
     
-    // Add session dispatcher to mapping table
+    auto completion = std::make_shared<std::promise<void>>();
+    auto finished = completion->get_future().share();
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (!running_ || (max_sessions_ > 0 && session_dispatchers_.size() >= max_sessions_)) {
+            res.status = 503;
+            res.set_content("{\"error\":\"Server unavailable\"}", "application/json");
+            return;
+        }
         session_dispatchers_[session_id] = session_dispatcher;
-    }
-    
-    // Create session thread
-    auto thread = std::make_unique<std::thread>([this, res, session_id, session_uri, session_dispatcher]() {
-        try {
-            // Send initial session URI
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            std::stringstream ss;
-            ss << "event: endpoint\r\ndata: " << session_uri << "\r\n\r\n";
-            session_dispatcher->send_event(ss.str());
-            
-            // Update activity time (after sending message)
-            session_dispatcher->update_activity();
-            
-            // Periodic SSE keepalives. Use bare ":" comments rather than a
-            // custom "event: heartbeat" so spec-compliant clients ignore them
-            // outright; some MCP clients treat unknown event types as
-            // protocol violations and tear down the stream, which we saw on
-            // the Aurora device producing ~30-55s session lifetimes.
-            //
-            // Uses an interruptible wait so server::stop() (which calls
-            // dispatcher close()) can wake this thread immediately —
-            // previously a naked sleep_for(5s) meant stop() had to either
-            // wait up to 5s or detach the thread (hazardous: detached thread
-            // outlives server and crashes on use-after-free).
-            while (running_ && !session_dispatcher->is_closed()) {
-                auto timeout = std::chrono::seconds(5) +
-                               std::chrono::milliseconds(rand() % 500);
-                if (session_dispatcher->wait_for_close(timeout)) {
-                    break; // Dispatcher closed — exit cleanly
-                }
 
-                if (session_dispatcher->is_closed() || !running_) {
-                    break;
+        // Create session thread
+        auto thread = std::make_unique<std::thread>([this, session_id, session_uri, session_dispatcher, completion]() {
+            try {
+                // Send initial session URI
+                if (session_dispatcher->wait_for_close(std::chrono::milliseconds(500))) {
+                    completion->set_value();
+                    return;
                 }
+                std::stringstream ss;
+                ss << "event: endpoint\r\ndata: " << session_uri << "\r\n\r\n";
+                session_dispatcher->send_event(ss.str());
+            
+                // Update activity time (after sending message)
+                session_dispatcher->update_activity();
+            
+                // Periodic SSE keepalives. Use bare ":" comments rather than a
+                // custom "event: heartbeat" so spec-compliant clients ignore them
+                // outright; some MCP clients treat unknown event types as
+                // protocol violations and tear down the stream, which we saw on
+                // the Aurora device producing ~30-55s session lifetimes.
+                //
+                // Uses an interruptible wait so server::stop() (which calls
+                // dispatcher close()) can wake this thread immediately —
+                // previously a naked sleep_for(5s) meant stop() had to either
+                // wait up to 5s or detach the thread (hazardous: detached thread
+                // outlives server and crashes on use-after-free).
+                while (running_ && !session_dispatcher->is_closed()) {
+                    auto timeout = std::chrono::seconds(5) +
+                                   std::chrono::milliseconds(rand() % 500);
+                    if (session_dispatcher->wait_for_close(timeout)) {
+                        break; // Dispatcher closed — exit cleanly
+                    }
 
-                try {
-                    bool sent = session_dispatcher->send_event(":\n\n");
-                    if (!sent) {
-                        LOG_WARNING("Failed to send keepalive, client may have closed connection: ", session_id);
+                    if (session_dispatcher->is_closed() || !running_) {
                         break;
                     }
-                    session_dispatcher->update_activity();
-                } catch (const std::exception& e) {
-                    LOG_ERROR("Failed to send keepalive: ", e.what());
-                    break;
+
+                    try {
+                        bool sent = session_dispatcher->send_event(":\n\n");
+                        if (!sent) {
+                            LOG_WARNING("Failed to send keepalive, client may have closed connection: ", session_id);
+                            break;
+                        }
+                        session_dispatcher->update_activity();
+                    } catch (const std::exception& e) {
+                        LOG_ERROR("Failed to send keepalive: ", e.what());
+                        break;
+                    }
                 }
+            } catch (const std::exception& e) {
+                LOG_ERROR("SSE session thread exception: ", session_id, ", ", e.what());
             }
-        } catch (const std::exception& e) {
-            LOG_ERROR("SSE session thread exception: ", session_id, ", ", e.what());
-        }
         
-        close_session(session_id);
-    });
-    
-    // Store thread
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        sse_threads_[session_id] = std::move(thread);
+            close_session(session_id);
+            completion->set_value();
+        });
+        sse_threads_.emplace(session_id, sse_thread{std::move(thread), std::move(finished)});
     }
     
     // Setup chunked content provider
@@ -1780,27 +1769,33 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
     // Has requests — process and decide response format
     // For initialize: create session, return inline JSON with Mcp-Session-Id header
     if (is_initialize) {
-        // Enforce session limit
-        if (max_sessions_ > 0) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (session_dispatchers_.size() >= max_sessions_) {
-                res.status = 503;
-                res.set_content("{\"error\":\"Too many sessions\"}", "application/json");
-                return;
-            }
-        }
-
         session_id = generate_session_id();
-
-        // Create session dispatcher for server-push via GET
         auto session_dispatcher = std::make_shared<event_dispatcher>();
         session_dispatcher->update_activity();
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (!running_ || (max_sessions_ > 0 && session_dispatchers_.size() >= max_sessions_)) {
+                res.status = 503;
+                res.set_content("{\"error\":\"Too many sessions or server stopping\"}", "application/json");
+                return;
+            }
             session_dispatchers_[session_id] = session_dispatcher;
         }
 
-        json result = handle_initialize(mcp_req, session_id, req.remote_addr);
+        // Every unsuccessful initialize must release its reservation, including
+        // exceptions thrown by validation or a host's session-open hook.
+        json result;
+        try {
+            result = handle_initialize(mcp_req, session_id, req.remote_addr);
+        } catch (...) {
+            close_session(session_id);
+            throw;
+        }
+        if (result.contains("error")) {
+            close_session(session_id);
+            res.set_content(result.dump(), "application/json");
+            return;
+        }
 
         res.set_header("Mcp-Session-Id", session_id);
         // Override the placeholder set at the top of the handler now that we
@@ -2127,14 +2122,17 @@ json server::handle_initialize(const request& req,
     std::string client_version = "UnknownVersion";
     
     if (params.contains("clientInfo")) {
-        if (params["clientInfo"].contains("name")) {
-            client_name = params["clientInfo"]["name"];
+        const auto& client = params["clientInfo"];
+        if (!client.is_object() ||
+            (client.contains("name") && !client["name"].is_string()) ||
+            (client.contains("version") && !client["version"].is_string())) {
+            return response::create_error(req.id, error_code::invalid_params,
+                                          "Invalid clientInfo").to_json();
         }
-        if (params["clientInfo"].contains("version")) {
-            client_version = params["clientInfo"]["version"];
-        }
+        client_name = client.value("name", client_name);
+        client_version = client.value("version", client_version);
     }
-    
+
     // Log connection
     LOG_INFO("Client connected: ", client_name, " ", client_version);
     
@@ -2146,6 +2144,11 @@ json server::handle_initialize(const request& req,
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        // A concurrent stop/delete can remove the reservation during validation.
+        if (!running_ || session_dispatchers_.count(session_id) == 0) {
+            return response::create_error(req.id, error_code::internal_error,
+                                          "Session closed during initialization").to_json();
+        }
         session_protocol_versions_[session_id] = negotiated_version;
 
         // clientInfo arrives once, here. Keeping it is what lets an operator
@@ -2371,10 +2374,10 @@ void server::set_session_initialized(const std::string& session_id, bool initial
         auto it = session_dispatchers_.find(session_id);
         bool has_dispatcher = (it != session_dispatchers_.end());
 
-        // For HTTP mode, we also track initialization in session_initialized_ map
-        // So we allow setting initialized state even without a dispatcher for HTTP sessions
+        // Both transports reserve a dispatcher. Never resurrect state after
+        // a concurrent deletion or shutdown removed it.
         if (!has_dispatcher) {
-            LOG_DEBUG("Setting initialization state for HTTP session: ", session_id);
+            return;
         }
 
         session_initialized_[session_id] = initialized;
@@ -2411,10 +2414,7 @@ std::string server::generate_session_id() const {
 }
 
 void server::start_maintenance_thread() {
-    if (session_timeout_ == 0) {
-        return;
-    }
-
+    // Reap completed heartbeat threads even when session expiry is disabled.
     std::lock_guard<std::mutex> lock(maintenance_mutex_);
     if (maintenance_thread_run_) {
         return;
@@ -2423,9 +2423,9 @@ void server::start_maintenance_thread() {
     maintenance_thread_run_ = true;
     maintenance_thread_ = std::make_unique<std::thread>([this]() {
         const auto check_interval =
-            std::chrono::seconds(std::min(session_timeout_, 10u));
+            std::chrono::seconds(1);
         while (true) {
-            // Check at least once per configured timeout, capped at 10 seconds.
+            // Reclaim completed threads promptly, including with expiry disabled.
             std::unique_lock<std::mutex> lock(maintenance_mutex_);
             auto should_exit = maintenance_cond_.wait_for(lock, check_interval, [this] {
                 return !maintenance_thread_run_;
@@ -2438,6 +2438,7 @@ void server::start_maintenance_thread() {
 
             try {
                 check_inactive_sessions();
+                reap_finished_sse_threads();
             } catch (const std::exception& e) {
                 LOG_ERROR("Exception in maintenance thread: ", e.what());
             } catch (...) {
@@ -2548,10 +2549,8 @@ void server::close_session(const std::string& session_id) {
         // Defensive — the inner try/catch should have caught everything.
     }
 
-    // NOTE: we intentionally do NOT touch sse_threads_ here. The heartbeat
-    // thread may itself be calling close_session during its own exit, so we
-    // can't join from within it. server::stop() drains and joins all
-    // entries in sse_threads_ on shutdown.
+    // The heartbeat publishes completion after returning from cleanup. The
+    // maintenance loop / next SSE admission reaps it; stop() joins the rest.
 }
 
 } // namespace mcp

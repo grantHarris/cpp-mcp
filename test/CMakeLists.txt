@@ -22,6 +22,7 @@ FetchContent_MakeAvailable(googletest)
 # Test sources
 set(TEST_SOURCES
     mcp_test.cpp
+    mcp_lifecycle_test.cpp
 )
 
 # Create test executable
