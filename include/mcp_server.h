@@ -914,8 +914,9 @@ private:
         return auto_lock(mutex_);
     }
 
-    // Cancelled request tracking (session_id -> set of request IDs)
-    std::map<std::string, std::set<std::string>> cancelled_requests_;
+    // Running method requests and whether each was cancelled (session_id ->
+    // request id -> cancelled). Entries live only while their handler runs.
+    std::map<std::string, std::map<std::string, bool>> in_flight_requests_;
 
     // Session management and maintenance
     void start_maintenance_thread();

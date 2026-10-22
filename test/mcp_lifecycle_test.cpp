@@ -26,6 +26,13 @@ struct server_test_access {
         std::lock_guard<std::mutex> lock(srv.mutex_);
         return srv.session_dispatchers_.at(sid);
     }
+    static json process(server &srv, const request &req, const std::string &sid) {
+        return srv.process_request(req, sid);
+    }
+    static size_t log_level_entries(server &srv) {
+        std::lock_guard<std::mutex> lock(srv.mutex_);
+        return srv.session_log_levels_.size();
+    }
     static bool wait_for_stop_completion(server &srv) {
         std::unique_lock<std::mutex> lock(srv.stop_mutex_);
         return srv.stop_cv_.wait_for(lock, std::chrono::seconds(3),
@@ -568,6 +575,62 @@ TEST_F(LifecycleTest, OpenGetStreamKeepsIdleSessionAlive) {
     get.wait();
     // With no stream the session is idle again, and it must still expire.
     EXPECT_EQ(std::future_status::ready, reaped_future.wait_for(std::chrono::seconds(5)));
+}
+
+// Cancellations are kept only for running requests, and only while they run,
+// so a stream of cancels for made-up ids cannot grow the server's memory.
+TEST_F(LifecycleTest, CancelMarksOnlyRunningRequests) {
+    const auto sid = initialized_session();
+    ASSERT_FALSE(sid.empty());
+    struct shared_state {
+        std::promise<void> entered, release;
+        std::atomic<bool> cancelled{false};
+    };
+    auto state = std::make_shared<shared_state>();
+    auto entered = state->entered.get_future();
+    auto release = state->release.get_future().share();
+    server *raw = srv.get();
+    srv->register_method("review/hold", [state, release, raw](const json &,
+                                                              const std::string &session) {
+        state->entered.set_value();
+        release.wait();
+        state->cancelled = raw->is_cancelled(7, session);
+        return json::object();
+    });
+    const auto cancel = [&](int id) {
+        auto res = cli->Post("/mcp", {{"Mcp-Session-Id", sid}},
+                             rpc_request("notifications/cancelled", {{"requestId", id}}, nullptr)
+                                 .dump(),
+                             "application/json");
+        return res ? res->status : 0;
+    };
+    for (int id = 100; id < 200; ++id) {
+        ASSERT_EQ(202, cancel(id));
+    }
+    EXPECT_FALSE(srv->is_cancelled(150, sid));
+
+    auto call = post_async("/mcp", sid, rpc_request("review/hold", json::object(), 7));
+    ASSERT_EQ(std::future_status::ready, entered.wait_for(std::chrono::seconds(3)));
+    EXPECT_FALSE(srv->is_cancelled(7, sid));
+    EXPECT_EQ(202, cancel(7));
+    EXPECT_TRUE(srv->is_cancelled(7, sid));
+    state->release.set_value();
+    ASSERT_EQ(std::future_status::ready, call.wait_for(std::chrono::seconds(3)));
+    EXPECT_TRUE(state->cancelled);
+    EXPECT_FALSE(srv->is_cancelled(7, sid)); // Finished requests are forgotten.
+}
+
+// A logging/setLevel that lands after its session closed must not recreate
+// per-session state that nothing will ever remove.
+TEST_F(LifecycleTest, SetLevelForClosedSessionLeavesNoState) {
+    const auto before = server_test_access::log_level_entries(*srv);
+    request req;
+    req.jsonrpc = "2.0";
+    req.id = 1;
+    req.method = "logging/setLevel";
+    req.params = {{"level", "debug"}};
+    server_test_access::process(*srv, req, "closed-session");
+    EXPECT_EQ(before, server_test_access::log_level_entries(*srv));
 }
 
 void destroy_server_from_its_own_callback() {

@@ -2095,11 +2095,18 @@ json server::process_request(const request& req,
         if (req.method == "notifications/initialized") {
             set_session_initialized(session_id, true);
         } else if (req.method == "notifications/cancelled") {
-            // Track cancelled request IDs
+            // Only a running request can be cancelled. Ignoring other ids
+            // keeps a stream of cancels from growing memory without bound.
             if (req.params.contains("requestId")) {
-                std::string rid = req.params["requestId"].dump();
+                const std::string rid = req.params["requestId"].dump();
                 std::lock_guard<std::mutex> lock(mutex_);
-                cancelled_requests_[session_id].insert(rid);
+                auto session = in_flight_requests_.find(session_id);
+                if (session != in_flight_requests_.end()) {
+                    auto running = session->second.find(rid);
+                    if (running != session->second.end()) {
+                        running->second = true;
+                    }
+                }
             }
         }
 
@@ -2148,6 +2155,12 @@ json server::process_request(const request& req,
             }
             {
                 std::lock_guard<std::mutex> lock(mutex_);
+                // The session may have closed while this request waited; do not
+                // recreate state that nothing would remove.
+                if (session_dispatchers_.count(session_id) == 0) {
+                    return response::create_error(req.id, error_code::invalid_request,
+                                                  "Session not found").to_json();
+                }
                 session_log_levels_[session_id] = level;
             }
             LOG_INFO("Session ", session_id, " set log level to: ", level);
@@ -2174,6 +2187,27 @@ json server::process_request(const request& req,
         }
         
         if (handler) {
+            const std::string rid = req.id.dump();
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                in_flight_requests_[session_id][rid] = false;
+            }
+            struct in_flight_guard {
+                server& self;
+                const std::string& session_id;
+                const std::string& rid;
+                ~in_flight_guard() {
+                    std::lock_guard<std::mutex> lock(self.mutex_);
+                    auto session = self.in_flight_requests_.find(session_id);
+                    if (session != self.in_flight_requests_.end()) {
+                        session->second.erase(rid);
+                        if (session->second.empty()) {
+                            self.in_flight_requests_.erase(session);
+                        }
+                    }
+                }
+            } guard{*this, session_id, rid};
+
             // Call handler
             LOG_INFO("Calling method handler: ", req.method);            
             json result = handler(req.params, session_id);
@@ -2466,9 +2500,12 @@ bool server::is_cancelled(const json& request_id, const std::string& session_id)
         return true;
     }
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = cancelled_requests_.find(session_id);
-    if (it == cancelled_requests_.end()) return false;
-    return it->second.count(request_id.dump()) > 0;
+    auto session = in_flight_requests_.find(session_id);
+    if (session == in_flight_requests_.end()) {
+        return false;
+    }
+    auto running = session->second.find(request_id.dump());
+    return running != session->second.end() && running->second;
 }
 
 std::string server::session_protocol_version(const std::string& session_id) const {
@@ -2656,7 +2693,7 @@ void server::close_session(const std::string& session_id) {
         session_protocol_versions_.erase(session_id);
         session_clients_.erase(session_id);
         session_log_levels_.erase(session_id);
-        cancelled_requests_.erase(session_id);
+        in_flight_requests_.erase(session_id);
         // Copy cleanup handlers so we can invoke them without holding the lock.
         cleanup_handlers_copy = session_cleanup_handler_;
     }

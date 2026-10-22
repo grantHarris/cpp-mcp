@@ -1460,8 +1460,9 @@ TEST_F(ServerTest, CancellationTracking) {
     auto res = mcp_post(*cli_, "/mcp", cancel, sid);
     EXPECT_EQ(res["_status"], 202);
 
-    // Server should now report that request 42 is cancelled
-    EXPECT_TRUE(srv_->is_cancelled(42, sid));
+    // Request 42 is not running, so the cancel is ignored. Cancelling a
+    // running request: LifecycleTest.CancelMarksOnlyRunningRequests.
+    EXPECT_FALSE(srv_->is_cancelled(42, sid));
     EXPECT_FALSE(srv_->is_cancelled(99, sid));
 }
 
