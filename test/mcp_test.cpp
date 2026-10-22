@@ -471,6 +471,42 @@ TEST_F(ServerTest, AcceptsMissingProtocolVersionHeader) {
     EXPECT_EQ(res["_status"], 200);
 }
 
+// Opens an SSE stream and returns its status and every Content-Type value, then cancels:
+// the stream never ends on its own.
+static std::pair<int, std::vector<std::string>> sse_content_types(
+    httplib::Client& cli, const std::string& path, const httplib::Headers& headers = {}) {
+    int status = 0;
+    std::vector<std::string> types;
+    cli.Get(path, headers,
+            [&](const httplib::Response& r) {
+                status = r.status;
+                auto range = r.headers.equal_range("Content-Type");
+                for (auto it = range.first; it != range.second; ++it) {
+                    types.push_back(it->second);
+                }
+                return false;
+            },
+            [](const char*, size_t) { return false; });
+    return {status, types};
+}
+
+// A repeated Content-Type reads as "text/event-stream, text/event-stream", which strict
+// clients (the MCP Python SDK 2.x) refuse.
+TEST_F(ServerTest, LegacySseStreamSendsOneContentType) {
+    auto [status, types] = sse_content_types(*cli_, "/sse");
+    EXPECT_EQ(status, 200);
+    EXPECT_EQ(types, std::vector<std::string>{"text/event-stream"});
+}
+
+TEST_F(ServerTest, StreamableHttpGetStreamSendsOneContentType) {
+    auto [sid, _] = mcp_initialize(*cli_);
+    ASSERT_FALSE(sid.empty());
+    auto [status, types] = sse_content_types(
+        *cli_, "/mcp", {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}});
+    EXPECT_EQ(status, 200);
+    EXPECT_EQ(types, std::vector<std::string>{"text/event-stream"});
+}
+
 // Origin allowlist with HTTP 403 (spec 2025-11-25).
 namespace {
 struct OriginServer {
