@@ -118,15 +118,16 @@ bool validate_size_constraint(const mcp::json& schema, const char* keyword,
     if (!schema.contains(keyword)) {
         return true;
     }
+    // JSON Schema bounds are non-negative integers, and 3.0 is one. A bound
+    // that is not one fails closed rather than going silently unenforced.
     const auto& bound = schema[keyword];
-    if ((!bound.is_number_integer() && !bound.is_number_unsigned()) ||
-        (!bound.is_number_unsigned() && bound.get<int64_t>() < 0)) {
+    const double limit = bound.is_number() ? bound.get<double>() : -1;
+    if (limit < 0 || std::trunc(limit) != limit) {
         error = path + " has invalid " + keyword + " schema";
         return false;
     }
-    const uint64_t limit = bound.get<uint64_t>();
-    if (minimum ? static_cast<uint64_t>(actual) < limit
-                : static_cast<uint64_t>(actual) > limit) {
+    const auto size = static_cast<double>(actual);
+    if (minimum ? size < limit : size > limit) {
         error = path + failure;
         return false;
     }

@@ -228,7 +228,9 @@ TEST_F(LifecycleTest, DisconnectingStreamableGetKeepsSessionAndPushChannelUsable
     EXPECT_EQ(200, ping->status);
 }
 
-TEST_F(LifecycleTest, SignedLiteralSchemaSizeLimitsMatchParsedSchemas) {
+// A size bound can arrive as a signed literal, a parsed unsigned value, or an
+// integral float such as Python's json.dumps(64.0). All mean the same limit.
+TEST_F(LifecycleTest, SchemaSizeLimitsAcceptEveryIntegerEncoding) {
     struct case_data {
         const char *keyword;
         const char *value_type;
@@ -251,19 +253,27 @@ TEST_F(LifecycleTest, SignedLiteralSchemaSizeLimitsMatchParsedSchemas) {
     ASSERT_FALSE(sid.empty());
     int id = 20;
     for (const auto &test : cases) {
-        json schema = {{"type", "object"}};
-        if (test.root_bound) {
-            schema[test.keyword] = test.limit;
-        } else {
-            schema["properties"] = {{"x", {{"type", test.value_type},
-                                          {test.keyword, test.limit}}}};
-        }
-        for (bool parsed : {false, true}) {
-            SCOPED_TRACE(std::string(test.keyword) + (parsed ? " parsed" : " literal"));
+        const auto schema_with = [&](const json &bound) {
+            json schema = {{"type", "object"}};
+            if (test.root_bound) {
+                schema[test.keyword] = bound;
+            } else {
+                schema["properties"] = {{"x", {{"type", test.value_type},
+                                              {test.keyword, bound}}}};
+            }
+            return schema;
+        };
+        const std::vector<std::pair<std::string, json>> encodings = {
+            {"literal", schema_with(test.limit)},
+            {"parsed", json::parse(schema_with(test.limit).dump())},
+            {"float", schema_with(static_cast<double>(test.limit))},
+        };
+        for (const auto &[encoding, schema] : encodings) {
+            SCOPED_TRACE(std::string(test.keyword) + " " + encoding);
             tool entry;
-            entry.name = std::string(test.keyword) + (parsed ? "-parsed" : "-literal");
+            entry.name = std::string(test.keyword) + "-" + encoding;
             entry.description = "size constraint regression";
-            entry.parameters_schema = parsed ? json::parse(schema.dump()) : schema;
+            entry.parameters_schema = schema;
             int calls = 0;
             srv->register_tool(entry, [&](const json &, const std::string &) -> json {
                 ++calls;
