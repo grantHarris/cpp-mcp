@@ -53,6 +53,9 @@ public:
                     }
                     
                     task();
+                    // Destroy the captures before reporting idle: wait_idle()
+                    // callers free state those captures may reference.
+                    task = nullptr;
                     {
                         std::lock_guard<std::mutex> lock(queue_mutex_);
                         --active_tasks_;

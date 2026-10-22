@@ -219,6 +219,25 @@ TEST(ThreadPool, ZeroThreadsFallsBackToOneWorker) {
     EXPECT_EQ(result.get(), 42);
 }
 
+// server::stop() frees session state once wait_idle() returns, so a task's
+// captures must already be destroyed by then.
+TEST(ThreadPool, WaitIdleWaitsForTaskCapturesToBeDestroyed) {
+    thread_pool pool(1);
+    std::atomic<bool> destroyed{false};
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    std::shared_ptr<int> capture(new int(0), [&destroyed](int* p) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        delete p;
+        destroyed = true;
+    });
+    pool.enqueue([capture, released] { released.wait(); });
+    capture.reset(); // The worker now owns the last reference.
+    release.set_value();
+    pool.wait_idle();
+    EXPECT_TRUE(destroyed);
+}
+
 // ===========================================================================
 // Server fixture — starts a server with Streamable HTTP on a unique port
 // ===========================================================================
