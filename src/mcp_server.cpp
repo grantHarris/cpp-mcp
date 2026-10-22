@@ -740,6 +740,9 @@ void server::stop() {
         if (deferred_stop_thread_.joinable()) {
             deferred_stop_thread_.join(); // Finished: it cleared stop_in_progress_.
         }
+        // Report stopped at once, as a stop() that waits would. stop_impl()
+        // repeats this under mutex_, which orders it with session admission.
+        running_ = false;
         stop_in_progress_ = true;
         try {
             deferred_stop_thread_ = std::thread([this] {
@@ -760,8 +763,8 @@ void server::stop() {
     }
 
     // Wait out any shutdown already running, re-checking after each join: a
-    // callback can start another one while the lock is released. Then stop
-    // here too, since the server may have been restarted in between.
+    // callback can start another one while the lock is released.
+    bool joined_deferred = false;
     while (true) {
         stop_cv_.wait(lock, [this] { return !stop_in_progress_; });
         if (!deferred_stop_thread_.joinable()) {
@@ -771,6 +774,10 @@ void server::stop() {
         lock.unlock();
         finished.join();
         lock.lock();
+        joined_deferred = true;
+    }
+    if (joined_deferred && !running_) {
+        return; // That shutdown did the work, and nothing restarted since.
     }
     stop_in_progress_ = true;
     lock.unlock();
@@ -1549,6 +1556,9 @@ void server::handle_jsonrpc(const httplib::Request& req, httplib::Response& res)
             const std::string remote_addr = req.remote_addr;
             thread_pool_.enqueue([this, mcp_req, session_id, remote_addr]() {
                 server_thread_scope scope(this);
+                if (!running_) {
+                    return; // Shutdown drops work that has not started.
+                }
                 process_request(mcp_req, session_id, remote_addr);
             });
         } catch (const std::exception& e) {
@@ -1569,6 +1579,11 @@ void server::handle_jsonrpc(const httplib::Request& req, httplib::Response& res)
         const std::string remote_addr = req.remote_addr;
         thread_pool_.enqueue([this, mcp_req, session_id, remote_addr, dispatcher]() {
             server_thread_scope scope(this);
+            // Shutdown drops work that has not started: its response can no
+            // longer be delivered, and stop() would wait out its side effects.
+            if (!running_) {
+                return;
+            }
             // Process the request
             json response_json = process_request(mcp_req, session_id, remote_addr);
 

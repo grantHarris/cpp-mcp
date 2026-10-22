@@ -308,9 +308,10 @@ TEST_F(LifecycleTest, SchemaSizeLimitsAcceptEveryIntegerEncoding) {
     }
 }
 
-// stop() must not return while an accepted legacy callback is running or still
-// queued: a host frees what its callbacks use as soon as stop() returns.
-TEST_F(LifecycleTest, StopReturnsOnlyAfterAcceptedLegacyCallbacks) {
+// stop() must not return while an accepted legacy callback is running: a host
+// frees what its callbacks use as soon as stop() returns. Requests still queued
+// are dropped rather than run with their side effects after shutdown began.
+TEST_F(LifecycleTest, StopWaitsForRunningLegacyCallbacksAndDropsQueuedOnes) {
     // One pool worker, so the notification queues behind the held method.
     srv->stop();
     conf.threadpool_size = 1;
@@ -373,7 +374,7 @@ TEST_F(LifecycleTest, StopReturnsOnlyAfterAcceptedLegacyCallbacks) {
     state->release.set_value();
     ASSERT_EQ(std::future_status::ready, stopped.wait_for(std::chrono::seconds(3)));
     EXPECT_FALSE(state->stop_returned_while_held);
-    EXPECT_TRUE(state->notification_ran);
+    EXPECT_FALSE(state->notification_ran);
     EXPECT_TRUE(srv->get_sessions().empty());
 }
 
@@ -513,11 +514,13 @@ TEST_F(LifecycleTest, CleanupHookCanRequestStopFromHttpWorker) {
 TEST_F(LifecycleTest, LegacyMethodCanRequestStopFromPoolWorker) {
     const auto sid = initialized_session();
     ASSERT_FALSE(sid.empty());
-    auto returned = std::make_shared<std::promise<void>>();
+    auto returned = std::make_shared<std::promise<bool>>();
     auto returned_future = returned->get_future();
     srv->register_method("review/stop", [this, returned](const json &, const std::string &) {
         srv->stop();
-        returned->set_value();
+        // The deferred shutdown is still running, but the server is already
+        // no longer running from the caller's point of view.
+        returned->set_value(srv->is_running());
         return json::object();
     });
     auto accepted = cli->Post("/message?session_id=" + sid,
@@ -525,6 +528,7 @@ TEST_F(LifecycleTest, LegacyMethodCanRequestStopFromPoolWorker) {
     ASSERT_TRUE(accepted);
     EXPECT_EQ(202, accepted->status);
     ASSERT_EQ(std::future_status::ready, returned_future.wait_for(std::chrono::seconds(3)));
+    EXPECT_FALSE(returned_future.get());
     ASSERT_TRUE(server_test_access::wait_for_stop_completion(*srv));
     EXPECT_TRUE(srv->get_sessions().empty());
     ASSERT_TRUE(srv->start(false));
