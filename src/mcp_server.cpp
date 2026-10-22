@@ -47,13 +47,19 @@ mcp::json request_id_or_null(const mcp::json& message) {
     return nullptr;
 }
 
+// Serializes a message for the wire. Host data can hold invalid UTF-8, and a
+// plain dump() throws on it, which loses the whole reply.
+std::string wire(const mcp::json& message) {
+    return message.dump(-1, ' ', false, mcp::json::error_handler_t::replace);
+}
+
 void set_jsonrpc_error(httplib::Response& res,
                        int status,
                        const mcp::json& id,
                        mcp::error_code code,
                        const std::string& message) {
     res.status = status;
-    res.set_content(mcp::response::create_error(id, code, message).to_json().dump(),
+    res.set_content(wire(mcp::response::create_error(id, code, message).to_json()),
                     "application/json");
 }
 
@@ -689,6 +695,7 @@ bool server::start(bool blocking) {
     // failed instantly clear running_ and then have it overwritten with
     // true by this thread, latching "running" onto a dead server.
     running_ = true;
+    started_ = true;
 
     auto listener = std::make_shared<std::promise<bool>>();
     auto listened = listener->get_future();
@@ -764,7 +771,6 @@ void server::stop() {
 
     // Wait out any shutdown already running, re-checking after each join: a
     // callback can start another one while the lock is released.
-    bool joined_deferred = false;
     while (true) {
         stop_cv_.wait(lock, [this] { return !stop_in_progress_; });
         if (!deferred_stop_thread_.joinable()) {
@@ -774,10 +780,9 @@ void server::stop() {
         lock.unlock();
         finished.join();
         lock.lock();
-        joined_deferred = true;
     }
-    if (joined_deferred && !running_) {
-        return; // That shutdown did the work, and nothing restarted since.
+    if (!started_) {
+        return; // Never started, or a shutdown already completed since.
     }
     stop_in_progress_ = true;
     lock.unlock();
@@ -834,6 +839,7 @@ void server::stop_impl() {
     // what they use once stop() returns, so they must finish first. Nothing
     // can enqueue more: the HTTP workers that do are joined above.
     thread_pool_.wait_idle();
+    started_ = false;
     LOG_INFO("MCP server stopped");
 }
 
@@ -1589,7 +1595,7 @@ void server::handle_jsonrpc(const httplib::Request& req, httplib::Response& res)
 
             // Send response via SSE
             std::stringstream ss;
-            ss << "event: message\r\ndata: " << response_json.dump() << "\r\n\r\n";
+            ss << "event: message\r\ndata: " << wire(response_json) << "\r\n\r\n";
             bool result = dispatcher->send_event(ss.str());
 
             if (!result) {
@@ -1920,7 +1926,7 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
         }
         if (result.contains("error")) {
             close_session(session_id);
-            res.set_content(result.dump(), "application/json");
+            res.set_content(wire(result), "application/json");
             return;
         }
 
@@ -1933,14 +1939,14 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
             res.set_header("MCP-Protocol-Version", negotiated);
         }
         res.set_header("Content-Type", "application/json");
-        res.set_content(result.dump(), "application/json");
+        res.set_content(wire(result), "application/json");
         return;
     }
 
     // Non-initialize request with an id: process synchronously and return inline JSON.
     json result = process_request(mcp_req, session_id, req.remote_addr);
     res.set_header("Content-Type", "application/json");
-    res.set_content(result.dump(), "application/json");
+    res.set_content(wire(result), "application/json");
 }
 
 void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res) {
@@ -2095,11 +2101,18 @@ json server::process_request(const request& req,
         if (req.method == "notifications/initialized") {
             set_session_initialized(session_id, true);
         } else if (req.method == "notifications/cancelled") {
-            // Track cancelled request IDs
+            // Only a running request can be cancelled. Ignoring other ids
+            // keeps a stream of cancels from growing memory without bound.
             if (req.params.contains("requestId")) {
-                std::string rid = req.params["requestId"].dump();
+                const std::string rid = req.params["requestId"].dump();
                 std::lock_guard<std::mutex> lock(mutex_);
-                cancelled_requests_[session_id].insert(rid);
+                auto session = in_flight_requests_.find(session_id);
+                if (session != in_flight_requests_.end()) {
+                    auto running = session->second.find(rid);
+                    if (running != session->second.end()) {
+                        running->second = true;
+                    }
+                }
             }
         }
 
@@ -2148,6 +2161,12 @@ json server::process_request(const request& req,
             }
             {
                 std::lock_guard<std::mutex> lock(mutex_);
+                // The session may have closed while this request waited; do not
+                // recreate state that nothing would remove.
+                if (session_dispatchers_.count(session_id) == 0) {
+                    return response::create_error(req.id, error_code::invalid_request,
+                                                  "Session not found").to_json();
+                }
                 session_log_levels_[session_id] = level;
             }
             LOG_INFO("Session ", session_id, " set log level to: ", level);
@@ -2174,6 +2193,27 @@ json server::process_request(const request& req,
         }
         
         if (handler) {
+            const std::string rid = req.id.dump();
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                in_flight_requests_[session_id][rid] = false;
+            }
+            struct in_flight_guard {
+                server& self;
+                const std::string& session_id;
+                const std::string& rid;
+                ~in_flight_guard() {
+                    std::lock_guard<std::mutex> lock(self.mutex_);
+                    auto session = self.in_flight_requests_.find(session_id);
+                    if (session != self.in_flight_requests_.end()) {
+                        session->second.erase(rid);
+                        if (session->second.empty()) {
+                            self.in_flight_requests_.erase(session);
+                        }
+                    }
+                }
+            } guard{*this, session_id, rid};
+
             // Call handler
             LOG_INFO("Calling method handler: ", req.method);            
             json result = handler(req.params, session_id);
@@ -2352,7 +2392,7 @@ void server::send_jsonrpc(const std::string& session_id, const json& message) {
     
     // Send message
     std::stringstream ss;
-    ss << "event: message\r\ndata: " << message.dump() << "\r\n\r\n";
+    ss << "event: message\r\ndata: " << wire(message) << "\r\n\r\n";
     bool result = dispatcher->send_event(ss.str());
     
     if (!result) {
@@ -2466,9 +2506,12 @@ bool server::is_cancelled(const json& request_id, const std::string& session_id)
         return true;
     }
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = cancelled_requests_.find(session_id);
-    if (it == cancelled_requests_.end()) return false;
-    return it->second.count(request_id.dump()) > 0;
+    auto session = in_flight_requests_.find(session_id);
+    if (session == in_flight_requests_.end()) {
+        return false;
+    }
+    auto running = session->second.find(request_id.dump());
+    return running != session->second.end() && running->second;
 }
 
 std::string server::session_protocol_version(const std::string& session_id) const {
@@ -2656,7 +2699,7 @@ void server::close_session(const std::string& session_id) {
         session_protocol_versions_.erase(session_id);
         session_clients_.erase(session_id);
         session_log_levels_.erase(session_id);
-        cancelled_requests_.erase(session_id);
+        in_flight_requests_.erase(session_id);
         // Copy cleanup handlers so we can invoke them without holding the lock.
         cleanup_handlers_copy = session_cleanup_handler_;
     }

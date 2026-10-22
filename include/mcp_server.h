@@ -220,6 +220,10 @@ public:
                         return false;
                     }
                 }
+                // A connected stream is session activity. Otherwise a session
+                // whose only traffic is a GET waiting out a keepalive as long as
+                // the session timeout expires under the client.
+                last_activity_ = std::chrono::steady_clock::now();
             }
 
             if (closed_.load(std::memory_order_acquire) || superseded()) {
@@ -733,6 +737,8 @@ private:
     };
     std::map<std::string, sse_thread> sse_threads_;
     std::atomic<bool> stop_in_progress_{false};
+    // From a start() that bound until the shutdown after it completes.
+    std::atomic<bool> started_{false};
     std::mutex stop_mutex_;
     std::condition_variable stop_cv_;
     std::thread deferred_stop_thread_;
@@ -910,8 +916,9 @@ private:
         return auto_lock(mutex_);
     }
 
-    // Cancelled request tracking (session_id -> set of request IDs)
-    std::map<std::string, std::set<std::string>> cancelled_requests_;
+    // Running method requests and whether each was cancelled (session_id ->
+    // request id -> cancelled). Entries live only while their handler runs.
+    std::map<std::string, std::map<std::string, bool>> in_flight_requests_;
 
     // Session management and maintenance
     void start_maintenance_thread();

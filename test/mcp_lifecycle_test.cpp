@@ -26,6 +26,13 @@ struct server_test_access {
         std::lock_guard<std::mutex> lock(srv.mutex_);
         return srv.session_dispatchers_.at(sid);
     }
+    static json process(server &srv, const request &req, const std::string &sid) {
+        return srv.process_request(req, sid);
+    }
+    static size_t log_level_entries(server &srv) {
+        std::lock_guard<std::mutex> lock(srv.mutex_);
+        return srv.session_log_levels_.size();
+    }
     static bool wait_for_stop_completion(server &srv) {
         std::unique_lock<std::mutex> lock(srv.stop_mutex_);
         return srv.stop_cv_.wait_for(lock, std::chrono::seconds(3),
@@ -69,7 +76,12 @@ class LifecycleTest : public ::testing::Test {
         cli = std::make_unique<httplib::Client>(conf.host, conf.port);
         cli->set_read_timeout(3);
     }
-    void TearDown() override { srv->stop(); }
+    void TearDown() override {
+        if (srv) {
+            srv->stop();
+        }
+    }
+
     httplib::Result initialize(const json &req = initialize_request()) {
         return cli->Post("/mcp", req.dump(), "application/json");
     }
@@ -536,6 +548,183 @@ TEST_F(LifecycleTest, LegacyMethodCanRequestStopFromPoolWorker) {
     srv->stop();
     EXPECT_FALSE(srv->is_running());
     EXPECT_TRUE(srv->get_sessions().empty());
+}
+
+// A session whose only traffic is an open GET stream is in use. With the 30 s
+// keepalive and 30 s timeout defaults, the reaper closed it whenever a tick
+// fell between the keepalive deadline and the stream's next activity update.
+TEST_F(LifecycleTest, OpenGetStreamKeepsIdleSessionAlive) {
+    srv->stop();
+    conf.session_timeout = 1;
+    srv = std::make_unique<server>(conf);
+    ASSERT_TRUE(srv->start(false));
+    auto reaped = std::make_shared<std::promise<void>>();
+    auto reaped_future = reaped->get_future().share();
+    srv->register_session_cleanup("reaped", [reaped](const std::string &) {
+        try {
+            reaped->set_value();
+        } catch (const std::future_error &) {
+        }
+    });
+    const auto sid = initialized_session();
+    ASSERT_FALSE(sid.empty());
+    httplib::Client stream(conf.host, conf.port);
+    stream.set_read_timeout(60);
+    auto get = std::async(std::launch::async, [&] {
+        return stream.Get("/mcp", {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}},
+                          [](const char *, size_t) { return true; });
+    });
+    // Far longer than the 1 s timeout, far shorter than the 30 s keepalive.
+    EXPECT_EQ(std::future_status::timeout, reaped_future.wait_for(std::chrono::seconds(3)));
+    stream.stop();
+    get.wait();
+    // With no stream the session is idle again, and it must still expire.
+    EXPECT_EQ(std::future_status::ready, reaped_future.wait_for(std::chrono::seconds(5)));
+}
+
+// Cancellations are kept only for running requests, and only while they run,
+// so a stream of cancels for made-up ids cannot grow the server's memory.
+TEST_F(LifecycleTest, CancelMarksOnlyRunningRequests) {
+    const auto sid = initialized_session();
+    ASSERT_FALSE(sid.empty());
+    struct shared_state {
+        std::promise<void> entered, release;
+        std::atomic<bool> cancelled{false};
+    };
+    auto state = std::make_shared<shared_state>();
+    auto entered = state->entered.get_future();
+    auto release = state->release.get_future().share();
+    server *raw = srv.get();
+    srv->register_method("review/hold", [state, release, raw](const json &,
+                                                              const std::string &session) {
+        state->entered.set_value();
+        release.wait();
+        state->cancelled = raw->is_cancelled(7, session);
+        return json::object();
+    });
+    const auto cancel = [&](int id) {
+        auto res = cli->Post("/mcp", {{"Mcp-Session-Id", sid}},
+                             rpc_request("notifications/cancelled", {{"requestId", id}}, nullptr)
+                                 .dump(),
+                             "application/json");
+        return res ? res->status : 0;
+    };
+    for (int id = 100; id < 200; ++id) {
+        ASSERT_EQ(202, cancel(id));
+    }
+    EXPECT_FALSE(srv->is_cancelled(150, sid));
+
+    auto call = post_async("/mcp", sid, rpc_request("review/hold", json::object(), 7));
+    ASSERT_EQ(std::future_status::ready, entered.wait_for(std::chrono::seconds(3)));
+    EXPECT_FALSE(srv->is_cancelled(7, sid));
+    EXPECT_EQ(202, cancel(7));
+    EXPECT_TRUE(srv->is_cancelled(7, sid));
+    state->release.set_value();
+    ASSERT_EQ(std::future_status::ready, call.wait_for(std::chrono::seconds(3)));
+    EXPECT_TRUE(state->cancelled);
+    EXPECT_FALSE(srv->is_cancelled(7, sid)); // Finished requests are forgotten.
+}
+
+// A logging/setLevel that lands after its session closed must not recreate
+// per-session state that nothing will ever remove.
+TEST_F(LifecycleTest, SetLevelForClosedSessionLeavesNoState) {
+    const auto before = server_test_access::log_level_entries(*srv);
+    request req;
+    req.jsonrpc = "2.0";
+    req.id = 1;
+    req.method = "logging/setLevel";
+    req.params = {{"level", "debug"}};
+    server_test_access::process(*srv, req, "closed-session");
+    EXPECT_EQ(before, server_test_access::log_level_entries(*srv));
+}
+
+// Reads a legacy /sse stream on its own thread.
+struct legacy_stream {
+    httplib::Client client;
+    std::mutex m;
+    std::condition_variable cv;
+    std::string received;
+    bool done = false;
+    std::thread reader;
+
+    legacy_stream(const std::string &host, int port) : client(host, port) {
+        client.set_read_timeout(10);
+        reader = std::thread([this] {
+            client.Get("/sse", [this](const char *data, size_t n) {
+                std::lock_guard<std::mutex> lock(m);
+                received.append(data, n);
+                cv.notify_all();
+                return !done;
+            });
+            std::lock_guard<std::mutex> lock(m);
+            done = true;
+            cv.notify_all();
+        });
+    }
+    ~legacy_stream() {
+        {
+            std::lock_guard<std::mutex> lock(m);
+            done = true;
+        }
+        client.stop();
+        reader.join();
+    }
+    bool wait_for(const std::string &text) {
+        std::unique_lock<std::mutex> lock(m);
+        return cv.wait_for(lock, std::chrono::seconds(3),
+                           [&] { return received.find(text) != std::string::npos; });
+    }
+    std::string endpoint() {
+        if (!wait_for("session_id=")) {
+            return {};
+        }
+        std::lock_guard<std::mutex> lock(m);
+        const auto start = received.find("/message?");
+        return received.substr(start, received.find('\r', start) - start);
+    }
+};
+
+// Handler results with invalid UTF-8 must still reach the client. Serializing
+// them threw: Streamable HTTP answered 500 and legacy SSE never answered.
+TEST_F(LifecycleTest, InvalidUtf8InResultIsReplacedNotDropped) {
+    srv->register_method("review/bytes", [](const json &, const std::string &) {
+        return json{{"text", std::string("bad \xff byte")}};
+    });
+    const auto sid = initialized_session();
+    ASSERT_FALSE(sid.empty());
+    auto res = cli->Post("/mcp", {{"Mcp-Session-Id", sid}},
+                         rpc_request("review/bytes", json::object(), 5).dump(), "application/json");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(200, res->status);
+    EXPECT_NE(std::string::npos, res->body.find("bad \xEF\xBF\xBD byte"));
+
+    legacy_stream sse(conf.host, conf.port);
+    const auto endpoint = sse.endpoint();
+    ASSERT_FALSE(endpoint.empty());
+    const auto post = [&](const json &body) {
+        auto r = cli->Post(endpoint, body.dump(), "application/json");
+        return r ? r->status : 0;
+    };
+    ASSERT_EQ(202, post(initialize_request()));
+    ASSERT_TRUE(sse.wait_for("\"id\":1"));
+    ASSERT_EQ(202, post(rpc_request("notifications/initialized", json::object(), nullptr)));
+    ASSERT_EQ(202, post(rpc_request("review/bytes", json::object(), 6)));
+    EXPECT_TRUE(sse.wait_for("\"id\":6"));
+}
+
+// Destroying a server after stop() must not run the whole shutdown again.
+TEST_F(LifecycleTest, StopAfterCompletedShutdownDoesNothing) {
+    testing::internal::CaptureStderr();
+    srv->stop();
+    srv->stop();
+    srv.reset();
+    const auto log = testing::internal::GetCapturedStderr();
+    size_t stops = 0;
+    for (auto at = log.find("MCP server stopped"); at != std::string::npos;
+         at = log.find("MCP server stopped", at + 1)) {
+        ++stops;
+    }
+    EXPECT_EQ(1u, stops);
 }
 
 void destroy_server_from_its_own_callback() {
