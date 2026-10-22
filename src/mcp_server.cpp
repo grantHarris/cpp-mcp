@@ -1943,11 +1943,13 @@ void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res)
     // Emit an initial SSE comment immediately so clients know the stream is
     // established before the first keepalive interval elapses.
     auto sent_initial_comment = std::make_shared<std::atomic<bool>>(false);
+    const auto stream = dispatcher->attach_stream();
 
     // Use chunked content provider — same pattern as legacy SSE
     res.set_chunked_content_provider(
         "text/event-stream",
-        [this, session_id, dispatcher, sent_initial_comment](size_t, httplib::DataSink& sink) {
+        [this, session_id, dispatcher, sent_initial_comment, stream](size_t,
+                                                                     httplib::DataSink& sink) {
             try {
                 if (dispatcher->is_closed() || !running_) {
                     return false;
@@ -1960,8 +1962,8 @@ void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res)
                 }
 
                 dispatcher->update_activity();
-                bool result = dispatcher->wait_event(&sink,
-                    std::chrono::milliseconds(MCP_SSE_KEEPALIVE_MS), false);
+                bool result = dispatcher->wait_event(
+                    &sink, std::chrono::milliseconds(MCP_SSE_KEEPALIVE_MS), stream);
                 if (!result) {
                     return false;
                 }

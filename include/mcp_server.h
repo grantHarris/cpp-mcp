@@ -152,13 +152,27 @@ public:
         close();
     }
 
+    // Streamable HTTP GET streams are reconnectable: a disconnect ends that
+    // stream, not the session. Each GET attaches a new stream that supersedes
+    // the older ones, so a stale stream whose peer vanished without a FIN
+    // cannot take events meant for the client's reconnected stream.
+    uint64_t attach_stream() {
+        std::lock_guard<std::mutex> lk(m_);
+        cv_.notify_all();
+        return ++stream_;
+    }
+
+    // stream 0 is a legacy SSE stream, which is the session itself: a
+    // disconnect closes the dispatcher. Any other value is from attach_stream().
     bool wait_event(
         httplib::DataSink* sink,
         const std::chrono::milliseconds& timeout = std::chrono::milliseconds(MCP_SSE_KEEPALIVE_MS),
-        bool close_on_disconnect = true) {
+        uint64_t stream = 0) {
         if (!sink || closed_.load(std::memory_order_acquire)) {
             return false;
         }
+        const bool reconnectable = stream != 0;
+        const auto superseded = [&] { return reconnectable && stream != stream_; };
 
         std::string message_copy;
         {
@@ -187,8 +201,9 @@ public:
                     deadline - std::chrono::steady_clock::now());
                 const auto slice = std::min(
                     remaining, std::chrono::milliseconds(MCP_SSE_PEER_CHECK_MS));
-                result = cv_.wait_for(lk, std::max(slice, std::chrono::milliseconds(0)), [this] {
-                    return !queue_.empty() || closed_.load(std::memory_order_acquire);
+                result = cv_.wait_for(lk, std::max(slice, std::chrono::milliseconds(0)), [&] {
+                    return !queue_.empty() || closed_.load(std::memory_order_acquire) ||
+                           superseded();
                 });
                 if (result || closed_.load(std::memory_order_acquire) ||
                     std::chrono::steady_clock::now() >= deadline) {
@@ -199,7 +214,7 @@ public:
                     const bool alive = sink->is_writable();
                     lk.lock();
                     if (!alive) {
-                        if (close_on_disconnect) {
+                        if (!reconnectable) {
                             close_locked();
                         }
                         return false;
@@ -207,7 +222,7 @@ public:
                 }
             }
 
-            if (closed_.load(std::memory_order_acquire)) {
+            if (closed_.load(std::memory_order_acquire) || superseded()) {
                 return false;
             }
 
@@ -216,13 +231,13 @@ public:
                 // connections and keep intermediaries from closing the stream.
                 try {
                     if (!sink->write(":\n\n", 3)) {
-                        if (close_on_disconnect) {
+                        if (!reconnectable) {
                             close_locked();
                         }
                         return false;
                     }
                 } catch (...) {
-                    if (close_on_disconnect) {
+                    if (!reconnectable) {
                         close_locked();
                     }
                     return false;
@@ -242,22 +257,24 @@ public:
             }
         }
 
+        bool written = false;
         try {
-            if (!message_copy.empty()) {
-                if (!sink->write(message_copy.data(), message_copy.size())) {
-                    if (close_on_disconnect) {
-                        close();
-                    }
-                    return false;
-                }
-            }
-            return true;
+            written = sink->write(message_copy.data(), message_copy.size());
         } catch (...) {
-            if (close_on_disconnect) {
-                close();
-            }
+        }
+        if (written) {
+            return true;
+        }
+        if (!reconnectable) {
+            close();
             return false;
         }
+        // The event was popped for a stream that just died. Put it back for
+        // the client's next stream instead of losing it.
+        std::lock_guard<std::mutex> lk(m_);
+        queue_.push_front(std::move(message_copy));
+        cv_.notify_all();
+        return false;
     }
 
     bool send_event(const std::string& message) {
@@ -334,6 +351,7 @@ private:
     mutable std::mutex m_;
     std::condition_variable cv_;
     std::deque<std::string> queue_;
+    uint64_t stream_ = 0;
     std::atomic<bool> closed_{false};
     std::chrono::steady_clock::time_point last_activity_{std::chrono::steady_clock::now()};
 };
