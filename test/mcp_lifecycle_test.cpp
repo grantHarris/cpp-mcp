@@ -633,6 +633,80 @@ TEST_F(LifecycleTest, SetLevelForClosedSessionLeavesNoState) {
     EXPECT_EQ(before, server_test_access::log_level_entries(*srv));
 }
 
+// Reads a legacy /sse stream on its own thread.
+struct legacy_stream {
+    httplib::Client client;
+    std::mutex m;
+    std::condition_variable cv;
+    std::string received;
+    bool done = false;
+    std::thread reader;
+
+    legacy_stream(const std::string &host, int port) : client(host, port) {
+        client.set_read_timeout(10);
+        reader = std::thread([this] {
+            client.Get("/sse", [this](const char *data, size_t n) {
+                std::lock_guard<std::mutex> lock(m);
+                received.append(data, n);
+                cv.notify_all();
+                return !done;
+            });
+            std::lock_guard<std::mutex> lock(m);
+            done = true;
+            cv.notify_all();
+        });
+    }
+    ~legacy_stream() {
+        {
+            std::lock_guard<std::mutex> lock(m);
+            done = true;
+        }
+        client.stop();
+        reader.join();
+    }
+    bool wait_for(const std::string &text) {
+        std::unique_lock<std::mutex> lock(m);
+        return cv.wait_for(lock, std::chrono::seconds(3),
+                           [&] { return received.find(text) != std::string::npos; });
+    }
+    std::string endpoint() {
+        if (!wait_for("session_id=")) {
+            return {};
+        }
+        std::lock_guard<std::mutex> lock(m);
+        const auto start = received.find("/message?");
+        return received.substr(start, received.find('\r', start) - start);
+    }
+};
+
+// Handler results with invalid UTF-8 must still reach the client. Serializing
+// them threw: Streamable HTTP answered 500 and legacy SSE never answered.
+TEST_F(LifecycleTest, InvalidUtf8InResultIsReplacedNotDropped) {
+    srv->register_method("review/bytes", [](const json &, const std::string &) {
+        return json{{"text", std::string("bad \xff byte")}};
+    });
+    const auto sid = initialized_session();
+    ASSERT_FALSE(sid.empty());
+    auto res = cli->Post("/mcp", {{"Mcp-Session-Id", sid}},
+                         rpc_request("review/bytes", json::object(), 5).dump(), "application/json");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(200, res->status);
+    EXPECT_NE(std::string::npos, res->body.find("bad \xEF\xBF\xBD byte"));
+
+    legacy_stream sse(conf.host, conf.port);
+    const auto endpoint = sse.endpoint();
+    ASSERT_FALSE(endpoint.empty());
+    const auto post = [&](const json &body) {
+        auto r = cli->Post(endpoint, body.dump(), "application/json");
+        return r ? r->status : 0;
+    };
+    ASSERT_EQ(202, post(initialize_request()));
+    ASSERT_TRUE(sse.wait_for("\"id\":1"));
+    ASSERT_EQ(202, post(rpc_request("notifications/initialized", json::object(), nullptr)));
+    ASSERT_EQ(202, post(rpc_request("review/bytes", json::object(), 6)));
+    EXPECT_TRUE(sse.wait_for("\"id\":6"));
+}
+
 void destroy_server_from_its_own_callback() {
     server::configuration conf;
     conf.host = "127.0.0.1";

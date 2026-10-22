@@ -47,13 +47,19 @@ mcp::json request_id_or_null(const mcp::json& message) {
     return nullptr;
 }
 
+// Serializes a message for the wire. Host data can hold invalid UTF-8, and a
+// plain dump() throws on it, which loses the whole reply.
+std::string wire(const mcp::json& message) {
+    return message.dump(-1, ' ', false, mcp::json::error_handler_t::replace);
+}
+
 void set_jsonrpc_error(httplib::Response& res,
                        int status,
                        const mcp::json& id,
                        mcp::error_code code,
                        const std::string& message) {
     res.status = status;
-    res.set_content(mcp::response::create_error(id, code, message).to_json().dump(),
+    res.set_content(wire(mcp::response::create_error(id, code, message).to_json()),
                     "application/json");
 }
 
@@ -1589,7 +1595,7 @@ void server::handle_jsonrpc(const httplib::Request& req, httplib::Response& res)
 
             // Send response via SSE
             std::stringstream ss;
-            ss << "event: message\r\ndata: " << response_json.dump() << "\r\n\r\n";
+            ss << "event: message\r\ndata: " << wire(response_json) << "\r\n\r\n";
             bool result = dispatcher->send_event(ss.str());
 
             if (!result) {
@@ -1920,7 +1926,7 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
         }
         if (result.contains("error")) {
             close_session(session_id);
-            res.set_content(result.dump(), "application/json");
+            res.set_content(wire(result), "application/json");
             return;
         }
 
@@ -1933,14 +1939,14 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
             res.set_header("MCP-Protocol-Version", negotiated);
         }
         res.set_header("Content-Type", "application/json");
-        res.set_content(result.dump(), "application/json");
+        res.set_content(wire(result), "application/json");
         return;
     }
 
     // Non-initialize request with an id: process synchronously and return inline JSON.
     json result = process_request(mcp_req, session_id, req.remote_addr);
     res.set_header("Content-Type", "application/json");
-    res.set_content(result.dump(), "application/json");
+    res.set_content(wire(result), "application/json");
 }
 
 void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res) {
@@ -2386,7 +2392,7 @@ void server::send_jsonrpc(const std::string& session_id, const json& message) {
     
     // Send message
     std::stringstream ss;
-    ss << "event: message\r\ndata: " << message.dump() << "\r\n\r\n";
+    ss << "event: message\r\ndata: " << wire(message) << "\r\n\r\n";
     bool result = dispatcher->send_event(ss.str());
     
     if (!result) {
