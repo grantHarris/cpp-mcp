@@ -1225,8 +1225,7 @@ void server::handle_sse(const httplib::Request& req, httplib::Response& res) {
     std::string session_id = generate_session_id();
     std::string session_uri = msg_endpoint_ + "?session_id=" + session_id;
     
-    // Setup SSE response headers
-    res.set_header("Content-Type", "text/event-stream");
+    // Setup SSE response headers (set_chunked_content_provider sets Content-Type)
     res.set_header("Cache-Control", "no-cache");
     res.set_header("Connection", "keep-alive");
     
@@ -1872,8 +1871,8 @@ void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res)
         return;
     }
 
-    // Open SSE stream for server-initiated notifications
-    res.set_header("Content-Type", "text/event-stream");
+    // Open SSE stream for server-initiated notifications (set_chunked_content_provider sets
+    // Content-Type)
     res.set_header("Cache-Control", "no-cache");
     res.set_header("Connection", "keep-alive");
 
