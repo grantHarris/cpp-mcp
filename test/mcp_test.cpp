@@ -219,6 +219,25 @@ TEST(ThreadPool, ZeroThreadsFallsBackToOneWorker) {
     EXPECT_EQ(result.get(), 42);
 }
 
+// server::stop() frees session state once wait_idle() returns, so a task's
+// captures must already be destroyed by then.
+TEST(ThreadPool, WaitIdleWaitsForTaskCapturesToBeDestroyed) {
+    thread_pool pool(1);
+    std::atomic<bool> destroyed{false};
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    std::shared_ptr<int> capture(new int(0), [&destroyed](int* p) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        delete p;
+        destroyed = true;
+    });
+    pool.enqueue([capture, released] { released.wait(); });
+    capture.reset(); // The worker now owns the last reference.
+    release.set_value();
+    pool.wait_idle();
+    EXPECT_TRUE(destroyed);
+}
+
 // ===========================================================================
 // Server fixture — starts a server with Streamable HTTP on a unique port
 // ===========================================================================
@@ -1815,6 +1834,64 @@ TEST(EventDispatcher, OverflowReturnsFalseRatherThanBlocking) {
 
     // One slot freed — next send succeeds.
     EXPECT_TRUE(dispatcher.send_event("y"));
+}
+
+// Streamable HTTP GET streams are reconnectable: an event whose write failed
+// must reach the client's next stream rather than vanish with the dead one.
+TEST(EventDispatcher, ReconnectableStreamKeepsEventWhoseWriteFailed) {
+    event_dispatcher dispatcher;
+    ASSERT_TRUE(dispatcher.send_event("event-1"));
+
+    httplib::DataSink dead;
+    dead.write = [](const char*, size_t) { return false; };
+    dead.is_writable = [] { return false; };
+    EXPECT_FALSE(dispatcher.wait_event(&dead, std::chrono::milliseconds(50),
+                                       dispatcher.attach_stream()));
+    EXPECT_FALSE(dispatcher.is_closed());
+
+    std::string out;
+    httplib::DataSink live;
+    live.write = [&out](const char* data, size_t len) {
+        out.append(data, len);
+        return true;
+    };
+    live.is_writable = [] { return true; };
+    EXPECT_TRUE(dispatcher.wait_event(&live, std::chrono::milliseconds(50),
+                                      dispatcher.attach_stream()));
+    EXPECT_EQ("event-1", out);
+}
+
+// A peer that vanished without a FIN leaves its GET writable for minutes. Once
+// the client reconnects, that stale stream must stop taking its events.
+TEST(EventDispatcher, NewerStreamSupersedesOlderStream) {
+    event_dispatcher dispatcher;
+    std::string stale_out;
+    httplib::DataSink stale;
+    stale.write = [&stale_out](const char* data, size_t len) {
+        stale_out.append(data, len);
+        return true;
+    };
+    stale.is_writable = [] { return true; };
+    const auto first = dispatcher.attach_stream();
+    auto parked = std::async(std::launch::async, [&] {
+        return dispatcher.wait_event(&stale, std::chrono::seconds(5), first);
+    });
+    const auto second = dispatcher.attach_stream();
+    ASSERT_EQ(std::future_status::ready, parked.wait_for(std::chrono::seconds(1)));
+    EXPECT_FALSE(parked.get());
+
+    ASSERT_TRUE(dispatcher.send_event("event-1"));
+    EXPECT_FALSE(dispatcher.wait_event(&stale, std::chrono::milliseconds(50), first));
+    std::string out;
+    httplib::DataSink live;
+    live.write = [&out](const char* data, size_t len) {
+        out.append(data, len);
+        return true;
+    };
+    live.is_writable = [] { return true; };
+    EXPECT_TRUE(dispatcher.wait_event(&live, std::chrono::milliseconds(50), second));
+    EXPECT_EQ("event-1", out);
+    EXPECT_TRUE(stale_out.empty());
 }
 
 // clientInfo is the only identity a client volunteers, and it arrives once at

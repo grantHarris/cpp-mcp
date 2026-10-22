@@ -152,10 +152,27 @@ public:
         close();
     }
 
-    bool wait_event(httplib::DataSink* sink, const std::chrono::milliseconds& timeout = std::chrono::milliseconds(MCP_SSE_KEEPALIVE_MS)) {
+    // Streamable HTTP GET streams are reconnectable: a disconnect ends that
+    // stream, not the session. Each GET attaches a new stream that supersedes
+    // the older ones, so a stale stream whose peer vanished without a FIN
+    // cannot take events meant for the client's reconnected stream.
+    uint64_t attach_stream() {
+        std::lock_guard<std::mutex> lk(m_);
+        cv_.notify_all();
+        return ++stream_;
+    }
+
+    // stream 0 is a legacy SSE stream, which is the session itself: a
+    // disconnect closes the dispatcher. Any other value is from attach_stream().
+    bool wait_event(
+        httplib::DataSink* sink,
+        const std::chrono::milliseconds& timeout = std::chrono::milliseconds(MCP_SSE_KEEPALIVE_MS),
+        uint64_t stream = 0) {
         if (!sink || closed_.load(std::memory_order_acquire)) {
             return false;
         }
+        const bool reconnectable = stream != 0;
+        const auto superseded = [&] { return reconnectable && stream != stream_; };
 
         std::string message_copy;
         {
@@ -184,8 +201,9 @@ public:
                     deadline - std::chrono::steady_clock::now());
                 const auto slice = std::min(
                     remaining, std::chrono::milliseconds(MCP_SSE_PEER_CHECK_MS));
-                result = cv_.wait_for(lk, std::max(slice, std::chrono::milliseconds(0)), [this] {
-                    return !queue_.empty() || closed_.load(std::memory_order_acquire);
+                result = cv_.wait_for(lk, std::max(slice, std::chrono::milliseconds(0)), [&] {
+                    return !queue_.empty() || closed_.load(std::memory_order_acquire) ||
+                           superseded();
                 });
                 if (result || closed_.load(std::memory_order_acquire) ||
                     std::chrono::steady_clock::now() >= deadline) {
@@ -196,13 +214,15 @@ public:
                     const bool alive = sink->is_writable();
                     lk.lock();
                     if (!alive) {
-                        close_locked();
+                        if (!reconnectable) {
+                            close_locked();
+                        }
                         return false;
                     }
                 }
             }
 
-            if (closed_.load(std::memory_order_acquire)) {
+            if (closed_.load(std::memory_order_acquire) || superseded()) {
                 return false;
             }
 
@@ -211,11 +231,15 @@ public:
                 // connections and keep intermediaries from closing the stream.
                 try {
                     if (!sink->write(":\n\n", 3)) {
-                        close_locked();
+                        if (!reconnectable) {
+                            close_locked();
+                        }
                         return false;
                     }
                 } catch (...) {
-                    close_locked();
+                    if (!reconnectable) {
+                        close_locked();
+                    }
                     return false;
                 }
                 return true;
@@ -233,18 +257,24 @@ public:
             }
         }
 
+        bool written = false;
         try {
-            if (!message_copy.empty()) {
-                if (!sink->write(message_copy.data(), message_copy.size())) {
-                    close();
-                    return false;
-                }
-            }
-            return true;
+            written = sink->write(message_copy.data(), message_copy.size());
         } catch (...) {
+        }
+        if (written) {
+            return true;
+        }
+        if (!reconnectable) {
             close();
             return false;
         }
+        // The event was popped for a stream that just died. Put it back for
+        // the client's next stream instead of losing it.
+        std::lock_guard<std::mutex> lk(m_);
+        queue_.push_front(std::move(message_copy));
+        cv_.notify_all();
+        return false;
     }
 
     bool send_event(const std::string& message) {
@@ -321,6 +351,7 @@ private:
     mutable std::mutex m_;
     std::condition_variable cv_;
     std::deque<std::string> queue_;
+    uint64_t stream_ = 0;
     std::atomic<bool> closed_{false};
     std::chrono::steady_clock::time_point last_activity_{std::chrono::steady_clock::now()};
 };
@@ -439,7 +470,9 @@ public:
     server(const server::configuration& conf);   
     
     /**
-     * @brief Destructor
+     * @brief Destructor. Stops the server. It must not run on one of this
+     * server's own threads (a callback or hook): shutdown joins those threads,
+     * so that aborts the process with a message.
      */
     ~server();
     
@@ -451,7 +484,17 @@ public:
     bool start(bool blocking = true);
     
     /**
-     * @brief Stop the server
+     * @brief Stop the server.
+     *
+     * Runs every session's cleanup hooks, then waits for all running and
+     * accepted callbacks to return. From the start of shutdown is_cancelled()
+     * reports true, so handlers must return once cancelled, and neither
+     * handlers nor hooks may block on a thread that is itself calling stop().
+     *
+     * Called on one of this server's own threads (from a callback or hook), it
+     * starts the shutdown and returns at once, because waiting would join the
+     * calling thread. From any other thread it returns only when shutdown has
+     * finished, including a shutdown another call already started.
      */
     void stop();
     
@@ -646,7 +689,8 @@ public:
      * @brief Check if a request has been cancelled
      * @param request_id The JSON-RPC request ID to check
      * @param session_id The session that sent the request
-     * @return True if the request was cancelled via notifications/cancelled
+     * @return True if the request was cancelled via notifications/cancelled,
+     *         or the server is no longer running (for example, stopping)
      */
     bool is_cancelled(const json& request_id, const std::string& session_id) const;
 
@@ -689,6 +733,10 @@ private:
     };
     std::map<std::string, sse_thread> sse_threads_;
     std::atomic<bool> stop_in_progress_{false};
+    std::mutex stop_mutex_;
+    std::condition_variable stop_cv_;
+    std::thread deferred_stop_thread_;
+    void stop_impl();
     void reap_finished_sse_threads();
     friend struct server_test_access;
 

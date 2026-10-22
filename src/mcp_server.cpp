@@ -112,6 +112,28 @@ bool schema_type_matches(const std::string& type, const mcp::json& value) {
     return false;
 }
 
+bool validate_size_constraint(const mcp::json& schema, const char* keyword,
+                              size_t actual, bool minimum, const std::string& path,
+                              const char* failure, std::string& error) {
+    if (!schema.contains(keyword)) {
+        return true;
+    }
+    // JSON Schema bounds are non-negative integers, and 3.0 is one. A bound
+    // that is not one fails closed rather than going silently unenforced.
+    const auto& bound = schema[keyword];
+    const double limit = bound.is_number() ? bound.get<double>() : -1;
+    if (limit < 0 || std::trunc(limit) != limit) {
+        error = path + " has invalid " + keyword + " schema";
+        return false;
+    }
+    const auto size = static_cast<double>(actual);
+    if (minimum ? size < limit : size > limit) {
+        error = path + failure;
+        return false;
+    }
+    return true;
+}
+
 bool validate_schema_combinators(const mcp::json& schema,
                                  const mcp::json& value,
                                  const std::string& path,
@@ -185,14 +207,10 @@ bool validate_object_schema(const mcp::json& schema,
         return false;
     }
 
-    if (schema.contains("minProperties") && schema["minProperties"].is_number_unsigned() &&
-        value.size() < schema["minProperties"].get<size_t>()) {
-        error = path + " has too few properties";
-        return false;
-    }
-    if (schema.contains("maxProperties") && schema["maxProperties"].is_number_unsigned() &&
-        value.size() > schema["maxProperties"].get<size_t>()) {
-        error = path + " has too many properties";
+    if (!validate_size_constraint(schema, "minProperties", value.size(), true, path,
+                                  " has too few properties", error) ||
+        !validate_size_constraint(schema, "maxProperties", value.size(), false, path,
+                                  " has too many properties", error)) {
         return false;
     }
 
@@ -344,14 +362,10 @@ bool validate_schema_type(const mcp::json& schema,
     }
 
     if (value.is_array()) {
-        if (schema.contains("minItems") && schema["minItems"].is_number_unsigned() &&
-            value.size() < schema["minItems"].get<size_t>()) {
-            error = path + " has too few items";
-            return false;
-        }
-        if (schema.contains("maxItems") && schema["maxItems"].is_number_unsigned() &&
-            value.size() > schema["maxItems"].get<size_t>()) {
-            error = path + " has too many items";
+        if (!validate_size_constraint(schema, "minItems", value.size(), true, path,
+                                      " has too few items", error) ||
+            !validate_size_constraint(schema, "maxItems", value.size(), false, path,
+                                      " has too many items", error)) {
             return false;
         }
         if (schema.contains("uniqueItems") && !schema["uniqueItems"].is_boolean()) {
@@ -382,14 +396,10 @@ bool validate_schema_type(const mcp::json& schema,
     if (value.is_string()) {
         const auto string_value = value.get<std::string>();
         const size_t length = utf8_code_point_count(string_value);
-        if (schema.contains("minLength") && schema["minLength"].is_number_unsigned() &&
-            length < schema["minLength"].get<size_t>()) {
-            error = path + " is too short";
-            return false;
-        }
-        if (schema.contains("maxLength") && schema["maxLength"].is_number_unsigned() &&
-            length > schema["maxLength"].get<size_t>()) {
-            error = path + " is too long";
+        if (!validate_size_constraint(schema, "minLength", length, true, path,
+                                      " is too short", error) ||
+            !validate_size_constraint(schema, "maxLength", length, false, path,
+                                      " is too long", error)) {
             return false;
         }
         if (schema.contains("pattern")) {
@@ -458,6 +468,38 @@ bool validate_tool_arguments(const mcp::json& schema,
                              std::string& error) {
     return validate_schema_type(schema, args, "arguments", error);
 }
+
+// Marks threads that run on a server's behalf: its HTTP and legacy pool
+// workers, heartbeat and maintenance threads, and whichever thread is running
+// its shutdown. Shutdown joins those threads, so stop() and ~server() must
+// know when they are on one. Marking the threads, not each callback entry
+// point, covers every callback a thread runs, including future ones.
+thread_local const mcp::server* current_server = nullptr;
+struct server_thread_scope {
+    const mcp::server* previous;
+    explicit server_thread_scope(const mcp::server* owner) : previous(current_server) {
+        current_server = owner;
+    }
+    ~server_thread_scope() { current_server = previous; }
+};
+
+// httplib's worker pool, with each request marked as running on a server thread.
+class server_task_queue : public httplib::TaskQueue {
+  public:
+    server_task_queue(const mcp::server* owner, size_t threads, size_t max_queued)
+        : owner_(owner), pool_(threads, max_queued) {}
+    bool enqueue(std::function<void()> fn) override {
+        return pool_.enqueue([owner = owner_, fn = std::move(fn)] {
+            server_thread_scope scope(owner);
+            fn();
+        });
+    }
+    void shutdown() override { pool_.shutdown(); }
+
+  private:
+    const mcp::server* owner_;
+    httplib::ThreadPool pool_;
+};
 } // anonymous namespace
 
 namespace mcp {
@@ -510,8 +552,9 @@ server::server(const server::configuration& conf)
     // ceiling from hardware_concurrency.
     unsigned int pool_size = http_thread_pool_size_;
     size_t max_queued_http_requests = max_queued_http_requests_;
-    http_server_->new_task_queue = [pool_size, max_queued_http_requests]() {
-        return new httplib::ThreadPool(pool_size, max_queued_http_requests);
+    http_server_->new_task_queue = [this, pool_size,
+                                    max_queued_http_requests]() -> httplib::TaskQueue* {
+        return new server_task_queue(this, pool_size, max_queued_http_requests);
     };
 
     if (max_request_body_size_ > 0) {
@@ -539,6 +582,12 @@ server::server(const server::configuration& conf)
 }
 
 server::~server() {
+    if (current_server == this) {
+        // Shutdown joins this thread and then frees state it is still using.
+        LOG_ERROR("mcp::server destroyed from one of its own threads; "
+                  "destroy it from a thread the server does not own");
+        std::terminate();
+    }
     stop();
 }
 
@@ -595,92 +644,154 @@ bool server::start(bool blocking) {
     });
     
     start_maintenance_thread();
-    
-    // Start server
-    if (blocking) {
-        running_ = true;
-        LOG_INFO("Starting server in blocking mode");
-        if (!http_server_->listen(host_.c_str(), port_)) {
+
+    // SO_REUSEADDR only -- explicitly NOT httplib's default, which sets
+    // SO_REUSEPORT wherever the platform defines it (Linux, macOS). Under
+    // SO_REUSEPORT a second process binds the same port happily and the
+    // kernel load-balances connections between them, so two servers both
+    // report success and each sees an arbitrary half of the traffic. For a
+    // control interface that is worse than failing: the operator gets a
+    // server that works when tested and drops requests in production.
+    //
+    // SO_REUSEADDR keeps the property actually wanted -- rebinding a port
+    // left in TIME_WAIT by a previous run, so a restart does not have to
+    // wait -- while still refusing a port another live listener holds.
+    http_server_->set_socket_options([](socket_t sock) {
+        int yes = 1;
+#ifdef _WIN32
+        setsockopt(sock,
+                   SOL_SOCKET,
+                   SO_REUSEADDR,
+                   reinterpret_cast<const char*>(&yes),
+                   sizeof(yes));
+#else
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+#endif
+    });
+
+    // Bind on THIS thread, so start() returns the bind outcome as a fact.
+    //
+    // listen() bundles bind and accept-loop, so running it on the worker
+    // made failure observable only asynchronously: start() returned true
+    // for a server that never bound, and a host could do no better than
+    // poll is_running() or probe the port with a TCP connect. Neither is
+    // sound -- the listener may not have reached its failure yet, and on
+    // platforms that set SO_REUSEPORT a successful connect does not even
+    // prove who owns the port. bind_to_port() answers definitively before
+    // any of that guesswork starts.
+    if (!http_server_->bind_to_port(host_.c_str(), port_)) {
+        stop_maintenance_thread();
+        LOG_ERROR("Failed to bind ", host_, ":", port_);
+        return false;
+    }
+
+    // Set before spawning, not after. The old order let a listener that
+    // failed instantly clear running_ and then have it overwritten with
+    // true by this thread, latching "running" onto a dead server.
+    running_ = true;
+
+    auto listener = std::make_shared<std::promise<bool>>();
+    auto listened = listener->get_future();
+    server_thread_ = std::make_unique<std::thread>([this, listener]() {
+        LOG_INFO("Serving on ", host_, ":", port_);
+        const bool clean = http_server_->listen_after_bind();
+        if (!clean) {
+            LOG_ERROR("Accept loop ended unexpectedly on ", host_, ":", port_);
+            http_server_->decommission();
             running_ = false;
             stop_maintenance_thread();
-            LOG_ERROR("Failed to start server on ", host_, ":", port_);
-            return false;
         }
-        return true;
-    } else {
-        // SO_REUSEADDR only -- explicitly NOT httplib's default, which sets
-        // SO_REUSEPORT wherever the platform defines it (Linux, macOS). Under
-        // SO_REUSEPORT a second process binds the same port happily and the
-        // kernel load-balances connections between them, so two servers both
-        // report success and each sees an arbitrary half of the traffic. For a
-        // control interface that is worse than failing: the operator gets a
-        // server that works when tested and drops requests in production.
-        //
-        // SO_REUSEADDR keeps the property actually wanted -- rebinding a port
-        // left in TIME_WAIT by a previous run, so a restart does not have to
-        // wait -- while still refusing a port another live listener holds.
-        http_server_->set_socket_options([](socket_t sock) {
-            int yes = 1;
-#ifdef _WIN32
-            setsockopt(sock,
-                       SOL_SOCKET,
-                       SO_REUSEADDR,
-                       reinterpret_cast<const char*>(&yes),
-                       sizeof(yes));
-#else
-            setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-#endif
-        });
-
-        // Bind on THIS thread, so start() returns the bind outcome as a fact.
-        //
-        // listen() bundles bind and accept-loop, so running it on the worker
-        // made failure observable only asynchronously: start() returned true
-        // for a server that never bound, and a host could do no better than
-        // poll is_running() or probe the port with a TCP connect. Neither is
-        // sound -- the listener may not have reached its failure yet, and on
-        // platforms that set SO_REUSEPORT a successful connect does not even
-        // prove who owns the port. bind_to_port() answers definitively before
-        // any of that guesswork starts.
-        if (!http_server_->bind_to_port(host_.c_str(), port_)) {
-            stop_maintenance_thread();
-            LOG_ERROR("Failed to bind ", host_, ":", port_);
-            return false;
-        }
-
-        // Set before spawning, not after. The old order let a listener that
-        // failed instantly clear running_ and then have it overwritten with
-        // true by this thread, latching "running" onto a dead server.
-        running_ = true;
-
-        server_thread_ = std::make_unique<std::thread>([this]() {
-            LOG_INFO("Serving on ", host_, ":", port_);
-            if (!http_server_->listen_after_bind()) {
-                LOG_ERROR("Accept loop ended unexpectedly on ", host_, ":", port_);
-                http_server_->decommission();
-                running_ = false;
-                stop_maintenance_thread();
-            }
-        });
-        // httplib::stop() only closes a running accept loop. A successful bind
-        // alone is insufficient: an immediate stop could otherwise happen
-        // before listen_after_bind sets its running flag, and then join forever.
-        http_server_->wait_until_ready();
+        listener->set_value(clean);
+    });
+    // httplib::stop() only closes a running accept loop. A successful bind
+    // alone is insufficient: an immediate stop could otherwise happen
+    // before listen_after_bind sets its running flag, and then join forever.
+    http_server_->wait_until_ready();
+    if (!blocking) {
         return running_;
     }
+    // Blocking mode waits for the same listener thread instead of serving
+    // on this one, so stop() can join the request workers in both modes.
+    LOG_INFO("Starting server in blocking mode");
+    return listened.get();
 }
 
 void server::stop() {
-    // Cleanup handlers may re-enter stop(). Only the outer call owns joining.
-    if (stop_in_progress_.exchange(true)) {
+    // Clears stop_in_progress_ however the shutdown ends, so a throw cannot
+    // leave start() refusing and every later stop() waiting forever.
+    struct stop_guard {
+        server& self;
+        ~stop_guard() {
+            {
+                std::lock_guard<std::mutex> lock(self.stop_mutex_);
+                self.stop_in_progress_ = false;
+            }
+            self.stop_cv_.notify_all();
+        }
+    };
+
+    std::unique_lock<std::mutex> lock(stop_mutex_);
+    if (current_server == this) {
+        // Shutdown joins this thread, so it cannot wait for shutdown. Hand it
+        // to a thread of its own; a shutdown already running covers this call.
+        if (stop_in_progress_) {
+            return;
+        }
+        if (deferred_stop_thread_.joinable()) {
+            deferred_stop_thread_.join(); // Finished: it cleared stop_in_progress_.
+        }
+        // Report stopped at once, as a stop() that waits would. stop_impl()
+        // repeats this under mutex_, which orders it with session admission.
+        running_ = false;
+        stop_in_progress_ = true;
+        try {
+            deferred_stop_thread_ = std::thread([this] {
+                stop_guard guard{*this};
+                try {
+                    stop_impl();
+                } catch (const std::exception& e) {
+                    LOG_ERROR("Exception while stopping MCP server: ", e.what());
+                } catch (...) {
+                    LOG_ERROR("Unknown exception while stopping MCP server");
+                }
+            });
+        } catch (...) {
+            stop_in_progress_ = false;
+            throw;
+        }
         return;
     }
-    struct stop_guard {
-        std::atomic<bool>& flag;
-        ~stop_guard() { flag.store(false); }
-    } guard{stop_in_progress_};
+
+    // Wait out any shutdown already running, re-checking after each join: a
+    // callback can start another one while the lock is released.
+    bool joined_deferred = false;
+    while (true) {
+        stop_cv_.wait(lock, [this] { return !stop_in_progress_; });
+        if (!deferred_stop_thread_.joinable()) {
+            break;
+        }
+        std::thread finished = std::move(deferred_stop_thread_);
+        lock.unlock();
+        finished.join();
+        lock.lock();
+        joined_deferred = true;
+    }
+    if (joined_deferred && !running_) {
+        return; // That shutdown did the work, and nothing restarted since.
+    }
+    stop_in_progress_ = true;
+    lock.unlock();
+    stop_guard guard{*this};
+    stop_impl();
+}
+
+void server::stop_impl() {
+    // Cleanup hooks below may call stop() again. On a marked thread that sees
+    // the shutdown in progress and returns, instead of waiting on itself.
+    server_thread_scope scope(this);
 
     // Admission checks and publishing new sessions use this same mutex.
+    // is_cancelled() reports true from here on.
     {
         std::lock_guard<std::mutex> lock(mutex_);
         running_ = false;
@@ -696,7 +807,8 @@ void server::stop() {
         }
     }
     // close_session owns exactly-once state removal and invokes host hooks
-    // outside mutex_, preserving the closing session ID as the argument.
+    // outside mutex_. Hooks run before the waits below, so a hook can cancel
+    // the callbacks those waits are for.
     for (const auto& session_id : sessions) {
         close_session(session_id);
     }
@@ -717,6 +829,11 @@ void server::stop() {
             entry.second.worker->join();
         }
     }
+
+    // Accepted legacy requests may still be running or queued. The host frees
+    // what they use once stop() returns, so they must finish first. Nothing
+    // can enqueue more: the HTTP workers that do are joined above.
+    thread_pool_.wait_idle();
     LOG_INFO("MCP server stopped");
 }
 
@@ -1248,6 +1365,7 @@ void server::handle_sse(const httplib::Request& req, httplib::Response& res) {
 
         // Create session thread
         auto thread = std::make_unique<std::thread>([this, session_id, session_uri, session_dispatcher, completion]() {
+            server_thread_scope scope(this);
             try {
                 // Send initial session URI
                 if (session_dispatcher->wait_for_close(std::chrono::milliseconds(500))) {
@@ -1437,6 +1555,10 @@ void server::handle_jsonrpc(const httplib::Request& req, httplib::Response& res)
         try {
             const std::string remote_addr = req.remote_addr;
             thread_pool_.enqueue([this, mcp_req, session_id, remote_addr]() {
+                server_thread_scope scope(this);
+                if (!running_) {
+                    return; // Shutdown drops work that has not started.
+                }
                 process_request(mcp_req, session_id, remote_addr);
             });
         } catch (const std::exception& e) {
@@ -1456,6 +1578,12 @@ void server::handle_jsonrpc(const httplib::Request& req, httplib::Response& res)
     try {
         const std::string remote_addr = req.remote_addr;
         thread_pool_.enqueue([this, mcp_req, session_id, remote_addr, dispatcher]() {
+            server_thread_scope scope(this);
+            // Shutdown drops work that has not started: its response can no
+            // longer be delivered, and stop() would wait out its side effects.
+            if (!running_) {
+                return;
+            }
             // Process the request
             json response_json = process_request(mcp_req, session_id, remote_addr);
 
@@ -1879,11 +2007,13 @@ void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res)
     // Emit an initial SSE comment immediately so clients know the stream is
     // established before the first keepalive interval elapses.
     auto sent_initial_comment = std::make_shared<std::atomic<bool>>(false);
+    const auto stream = dispatcher->attach_stream();
 
     // Use chunked content provider — same pattern as legacy SSE
     res.set_chunked_content_provider(
         "text/event-stream",
-        [this, session_id, dispatcher, sent_initial_comment](size_t, httplib::DataSink& sink) {
+        [this, session_id, dispatcher, sent_initial_comment, stream](size_t,
+                                                                     httplib::DataSink& sink) {
             try {
                 if (dispatcher->is_closed() || !running_) {
                     return false;
@@ -1896,7 +2026,8 @@ void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res)
                 }
 
                 dispatcher->update_activity();
-                bool result = dispatcher->wait_event(&sink);
+                bool result = dispatcher->wait_event(
+                    &sink, std::chrono::milliseconds(MCP_SSE_KEEPALIVE_MS), stream);
                 if (!result) {
                     return false;
                 }
@@ -2329,6 +2460,11 @@ void server::send_progress(const std::string& session_id, const json& progress_t
 }
 
 bool server::is_cancelled(const json& request_id, const std::string& session_id) const {
+    // A stopping server cancels everything: no notifications/cancelled can
+    // still arrive, and stop() waits for these handlers to return.
+    if (!running_) {
+        return true;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = cancelled_requests_.find(session_id);
     if (it == cancelled_requests_.end()) return false;
@@ -2421,6 +2557,7 @@ void server::start_maintenance_thread() {
 
     maintenance_thread_run_ = true;
     maintenance_thread_ = std::make_unique<std::thread>([this]() {
+        server_thread_scope scope(this);
         const auto check_interval =
             std::chrono::seconds(1);
         while (true) {

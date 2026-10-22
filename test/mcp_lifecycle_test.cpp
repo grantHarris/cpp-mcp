@@ -22,6 +22,15 @@ struct server_test_access {
         std::lock_guard<std::mutex> lock(srv.mutex_);
         return srv.sse_threads_.size();
     }
+    static std::shared_ptr<event_dispatcher> dispatcher(server &srv, const std::string &sid) {
+        std::lock_guard<std::mutex> lock(srv.mutex_);
+        return srv.session_dispatchers_.at(sid);
+    }
+    static bool wait_for_stop_completion(server &srv) {
+        std::unique_lock<std::mutex> lock(srv.stop_mutex_);
+        return srv.stop_cv_.wait_for(lock, std::chrono::seconds(3),
+                                     [&] { return !srv.stop_in_progress_; });
+    }
 };
 } // namespace mcp
 
@@ -36,6 +45,13 @@ json initialize_request() {
              {{"protocolVersion", MCP_VERSION},
               {"capabilities", json::object()},
               {"clientInfo", {{"name", "LifecycleTest"}, {"version", "1"}}}}}};
+}
+
+json rpc_request(const std::string &method, const json &params = json::object(),
+                 const json &id = 1) {
+    json out = {{"jsonrpc", "2.0"}, {"method", method}, {"params", params}};
+    if (!id.is_null()) out["id"] = id;
+    return out;
 }
 
 class LifecycleTest : public ::testing::Test {
@@ -56,6 +72,27 @@ class LifecycleTest : public ::testing::Test {
     void TearDown() override { srv->stop(); }
     httplib::Result initialize(const json &req = initialize_request()) {
         return cli->Post("/mcp", req.dump(), "application/json");
+    }
+    std::string initialized_session() {
+        auto response = initialize();
+        if (!response || response->status != 200 || !response->has_header("Mcp-Session-Id")) {
+            return {};
+        }
+        const auto sid = response->get_header_value("Mcp-Session-Id");
+        const auto initialized = rpc_request("notifications/initialized", json::object(), nullptr);
+        auto notice = cli->Post("/mcp", {{"Mcp-Session-Id", sid}}, initialized.dump(),
+                                "application/json");
+        return notice && notice->status == 202 ? sid : std::string{};
+    }
+    // Calls that block until their handler returns need their own connection.
+    std::future<httplib::Result> post_async(const std::string &path, const std::string &sid,
+                                            const json &body) {
+        return std::async(std::launch::async, [this, path, sid, body] {
+            httplib::Client client(conf.host, conf.port);
+            client.set_read_timeout(10);
+            return client.Post(path, {{"Mcp-Session-Id", sid}}, body.dump(),
+                               "application/json");
+        });
     }
     server::configuration conf;
     std::mutex cleanup_mutex;
@@ -166,6 +203,372 @@ TEST_F(LifecycleTest, ReconnectingSseClientsDoNotAccumulateFinishedThreads) {
     srv->stop();
     EXPECT_EQ(0u, server_test_access::heartbeat_count(*srv));
     EXPECT_EQ(8u, cleaned.size());
+}
+
+TEST_F(LifecycleTest, DisconnectingStreamableGetKeepsSessionAndPushChannelUsable) {
+    const auto sid = initialized_session();
+    ASSERT_FALSE(sid.empty());
+    auto dispatcher = server_test_access::dispatcher(*srv, sid);
+    const httplib::Headers headers = {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}};
+
+    std::string first_chunk;
+    auto first = cli->Get("/mcp", headers, [&](const char *data, size_t n) {
+        first_chunk.append(data, n);
+        return false; // Cancel this GET without terminating the MCP session.
+    });
+    EXPECT_EQ(":\n\n", first_chunk);
+    EXPECT_FALSE(dispatcher->wait_for_close(std::chrono::seconds(2)));
+    ASSERT_TRUE(dispatcher->send_event("event: message\ndata: reconnected\n\n"));
+
+    httplib::Client reconnect(conf.host, conf.port);
+    reconnect.set_read_timeout(3);
+    std::string received;
+    auto second = reconnect.Get("/mcp", headers, [&](const char *data, size_t n) {
+        received.append(data, n);
+        return received.find("reconnected") == std::string::npos;
+    });
+    EXPECT_NE(std::string::npos, received.find("reconnected"));
+    EXPECT_FALSE(dispatcher->is_closed());
+    const auto sessions = srv->get_sessions();
+    ASSERT_EQ(1u, sessions.size());
+    EXPECT_EQ(sid, sessions.front().session_id);
+    auto ping = cli->Post("/mcp", {{"Mcp-Session-Id", sid}},
+                          rpc_request("ping").dump(), "application/json");
+    ASSERT_TRUE(ping);
+    EXPECT_EQ(200, ping->status);
+}
+
+// A size bound can arrive as a signed literal, a parsed unsigned value, or an
+// integral float such as Python's json.dumps(64.0). All mean the same limit.
+TEST_F(LifecycleTest, SchemaSizeLimitsAcceptEveryIntegerEncoding) {
+    struct case_data {
+        const char *keyword;
+        const char *value_type;
+        int limit;
+        json invalid;
+        json valid;
+        bool root_bound = false;
+    };
+    const std::vector<case_data> cases = {
+        {"minLength", "string", 3, {{"x", "a"}}, {{"x", "abc"}}},
+        {"maxLength", "string", 1, {{"x", "abc"}}, {{"x", "a"}}},
+        {"minItems", "array", 3, {{"x", json::array({1})}},
+         {{"x", json::array({1, 2, 3})}}},
+        {"maxItems", "array", 1, {{"x", json::array({1, 2, 3})}},
+         {{"x", json::array({1})}}},
+        {"minProperties", "object", 2, {{"x", 1}}, {{"x", 1}, {"y", 2}}, true},
+        {"maxProperties", "object", 1, {{"x", 1}, {"y", 2}}, {{"x", 1}}, true},
+    };
+    const auto sid = initialized_session();
+    ASSERT_FALSE(sid.empty());
+    int id = 20;
+    for (const auto &test : cases) {
+        const auto schema_with = [&](const json &bound) {
+            json schema = {{"type", "object"}};
+            if (test.root_bound) {
+                schema[test.keyword] = bound;
+            } else {
+                schema["properties"] = {{"x", {{"type", test.value_type},
+                                              {test.keyword, bound}}}};
+            }
+            return schema;
+        };
+        const std::vector<std::pair<std::string, json>> encodings = {
+            {"literal", schema_with(test.limit)},
+            {"parsed", json::parse(schema_with(test.limit).dump())},
+            {"float", schema_with(static_cast<double>(test.limit))},
+        };
+        for (const auto &[encoding, schema] : encodings) {
+            SCOPED_TRACE(std::string(test.keyword) + " " + encoding);
+            tool entry;
+            entry.name = std::string(test.keyword) + "-" + encoding;
+            entry.description = "size constraint regression";
+            entry.parameters_schema = schema;
+            int calls = 0;
+            srv->register_tool(entry, [&](const json &, const std::string &) -> json {
+                ++calls;
+                return json::array();
+            });
+            const auto call = [&](const json &args) {
+                auto response = cli->Post("/mcp", {{"Mcp-Session-Id", sid}},
+                    rpc_request("tools/call", {{"name", entry.name}, {"arguments", args}}, id++).dump(),
+                    "application/json");
+                if (!response || response->status != 200) return json::object();
+                return json::parse(response->body);
+            };
+            auto bad = call(test.invalid);
+            ASSERT_TRUE(bad.contains("result"));
+            EXPECT_TRUE(bad["result"].value("isError", false));
+            EXPECT_EQ(0, calls);
+            auto good = call(test.valid);
+            ASSERT_TRUE(good.contains("result"));
+            EXPECT_FALSE(good["result"].value("isError", true));
+            EXPECT_EQ(1, calls);
+        }
+    }
+}
+
+// stop() must not return while an accepted legacy callback is running: a host
+// frees what its callbacks use as soon as stop() returns. Requests still queued
+// are dropped rather than run with their side effects after shutdown began.
+TEST_F(LifecycleTest, StopWaitsForRunningLegacyCallbacksAndDropsQueuedOnes) {
+    // One pool worker, so the notification queues behind the held method.
+    srv->stop();
+    conf.threadpool_size = 1;
+    srv = std::make_unique<server>(conf);
+    ASSERT_TRUE(srv->start(false));
+    const auto sid = initialized_session();
+    ASSERT_FALSE(sid.empty());
+    struct shared_state {
+        std::promise<void> entered, release, hook_ran, stop_returned;
+        std::atomic<bool> stop_returned_while_held{false};
+        std::atomic<bool> notification_ran{false};
+    };
+    auto state = std::make_shared<shared_state>();
+    auto entered = state->entered.get_future();
+    auto hook_ran = state->hook_ran.get_future();
+    auto release = state->release.get_future().share();
+    auto stop_returned = state->stop_returned.get_future().share();
+    srv->register_method("review/hold", [state, release, stop_returned](const json &,
+                                                                        const std::string &) {
+        state->entered.set_value();
+        release.wait();
+        // Always a timeout when stop() is correct: it cannot return while
+        // this callback is still running.
+        state->stop_returned_while_held =
+            stop_returned.wait_for(std::chrono::milliseconds(200)) == std::future_status::ready;
+        return json::object();
+    });
+    srv->register_notification("notifications/review", [state](const json &, const std::string &) {
+        state->notification_ran = true;
+    });
+    srv->register_session_cleanup("review",
+                                   [state](const std::string &) { state->hook_ran.set_value(); });
+    std::future<void> stopped;
+    struct release_on_exit {
+        std::shared_ptr<shared_state> state;
+        ~release_on_exit() {
+            try {
+                state->release.set_value();
+            } catch (const std::future_error &) {
+            }
+        }
+    } guard{state};
+
+    auto hold = cli->Post("/message?session_id=" + sid, rpc_request("review/hold").dump(),
+                          "application/json");
+    ASSERT_TRUE(hold);
+    ASSERT_EQ(202, hold->status);
+    ASSERT_EQ(std::future_status::ready, entered.wait_for(std::chrono::seconds(3)));
+    auto queued = cli->Post("/message?session_id=" + sid,
+                            rpc_request("notifications/review", json::object(), nullptr).dump(),
+                            "application/json");
+    ASSERT_TRUE(queued);
+    ASSERT_EQ(202, queued->status);
+    stopped = std::async(std::launch::async, [this, state] {
+        srv->stop();
+        state->stop_returned.set_value();
+    });
+    // Cleanup hooks run before stop() waits, so a hook can cancel callbacks.
+    EXPECT_EQ(std::future_status::ready, hook_ran.wait_for(std::chrono::seconds(3)));
+    state->release.set_value();
+    ASSERT_EQ(std::future_status::ready, stopped.wait_for(std::chrono::seconds(3)));
+    EXPECT_FALSE(state->stop_returned_while_held);
+    EXPECT_FALSE(state->notification_ran);
+    EXPECT_TRUE(srv->get_sessions().empty());
+}
+
+// A handler may wait for its session's cleanup hook to cancel it. stop() must
+// run that hook before it waits for the handler, or neither ever finishes.
+TEST_F(LifecycleTest, StopRunsCleanupHooksBeforeWaitingForCallbacks) {
+    const auto sid = initialized_session();
+    ASSERT_FALSE(sid.empty());
+    struct shared_state {
+        std::promise<void> entered, cancel;
+        std::atomic<bool> cancelled{false};
+    };
+    auto state = std::make_shared<shared_state>();
+    auto entered = state->entered.get_future();
+    auto cancel = state->cancel.get_future().share();
+    srv->register_method("review/wait", [state, cancel](const json &, const std::string &) {
+        state->entered.set_value();
+        state->cancelled =
+            cancel.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+        return json::object();
+    });
+    srv->register_session_cleanup("cancel", [state](const std::string &) {
+        try {
+            state->cancel.set_value();
+        } catch (const std::future_error &) {
+        }
+    });
+    auto call = post_async("/mcp", sid, rpc_request("review/wait"));
+    ASSERT_EQ(std::future_status::ready, entered.wait_for(std::chrono::seconds(3)));
+    auto stopped = std::async(std::launch::async, [this] { srv->stop(); });
+    EXPECT_EQ(std::future_status::ready, stopped.wait_for(std::chrono::seconds(3)));
+    EXPECT_TRUE(state->cancelled);
+}
+
+// Once stop() closes the listener no notifications/cancelled can arrive, so
+// is_cancelled() must report the shutdown itself to handlers that poll it.
+TEST_F(LifecycleTest, StopCancelsCallbacksThatPollIsCancelled) {
+    const auto sid = initialized_session();
+    ASSERT_FALSE(sid.empty());
+    struct shared_state {
+        std::promise<void> entered;
+        std::atomic<bool> cancelled{false};
+    };
+    auto state = std::make_shared<shared_state>();
+    auto entered = state->entered.get_future();
+    server *raw = srv.get();
+    srv->register_method("review/poll", [state, raw](const json &, const std::string &session) {
+        state->entered.set_value();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!state->cancelled && std::chrono::steady_clock::now() < deadline) {
+            state->cancelled = raw->is_cancelled(2, session);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return json::object();
+    });
+    auto accepted = cli->Post("/message?session_id=" + sid,
+                              rpc_request("review/poll", json::object(), 2).dump(),
+                              "application/json");
+    ASSERT_TRUE(accepted);
+    ASSERT_EQ(202, accepted->status);
+    ASSERT_EQ(std::future_status::ready, entered.wait_for(std::chrono::seconds(3)));
+    auto stopped = std::async(std::launch::async, [this] { srv->stop(); });
+    EXPECT_EQ(std::future_status::ready, stopped.wait_for(std::chrono::seconds(3)));
+    EXPECT_TRUE(state->cancelled);
+}
+
+// start(true) serves from the caller's thread. A stop() from another thread
+// must still wait for HTTP callbacks that are running.
+TEST_F(LifecycleTest, BlockingStopWaitsForRunningHttpCallbacks) {
+    srv->stop();
+    srv = std::make_unique<server>(conf);
+    struct shared_state {
+        std::promise<void> entered, release;
+    };
+    auto state = std::make_shared<shared_state>();
+    auto entered = state->entered.get_future();
+    auto release = state->release.get_future().share();
+    srv->register_method("review/hold", [state, release](const json &, const std::string &) {
+        state->entered.set_value();
+        release.wait();
+        return json::object();
+    });
+    auto serving = std::async(std::launch::async, [this] { return srv->start(true); });
+    std::future<void> stopped;
+    std::future<httplib::Result> call;
+    struct stop_on_exit {
+        server &srv;
+        std::shared_ptr<shared_state> state;
+        ~stop_on_exit() {
+            try {
+                state->release.set_value();
+            } catch (const std::future_error &) {
+            }
+            srv.stop();
+        }
+    } guard{*srv, state};
+
+    // Nothing signals when a blocking start() is accepting, so retry.
+    std::string sid;
+    for (int attempt = 0; attempt < 100 && sid.empty(); ++attempt) {
+        sid = initialized_session();
+        if (sid.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    ASSERT_FALSE(sid.empty());
+    call = post_async("/mcp", sid, rpc_request("review/hold"));
+    ASSERT_EQ(std::future_status::ready, entered.wait_for(std::chrono::seconds(3)));
+    stopped = std::async(std::launch::async, [this] { srv->stop(); });
+    EXPECT_EQ(std::future_status::timeout, stopped.wait_for(std::chrono::milliseconds(300)));
+    state->release.set_value();
+    ASSERT_EQ(std::future_status::ready, stopped.wait_for(std::chrono::seconds(3)));
+    ASSERT_EQ(std::future_status::ready, serving.wait_for(std::chrono::seconds(3)));
+    EXPECT_TRUE(serving.get());
+}
+
+TEST_F(LifecycleTest, CleanupHookCanRequestStopFromHttpWorker) {
+    const auto sid = initialized_session();
+    ASSERT_FALSE(sid.empty());
+    auto returned = std::make_shared<std::promise<void>>();
+    auto returned_future = returned->get_future();
+    srv->register_session_cleanup("stop-from-hook", [this, returned](const std::string &) {
+        srv->stop();
+        try {
+            returned->set_value();
+        } catch (const std::future_error &) {
+        }
+    });
+    auto deleted = cli->Delete("/mcp", {{"Mcp-Session-Id", sid}});
+    ASSERT_TRUE(deleted);
+    EXPECT_EQ(200, deleted->status);
+    ASSERT_EQ(std::future_status::ready, returned_future.wait_for(std::chrono::seconds(3)));
+    srv->stop(); // Outside a callback this also waits for deferred shutdown.
+    EXPECT_FALSE(srv->is_running());
+}
+
+TEST_F(LifecycleTest, LegacyMethodCanRequestStopFromPoolWorker) {
+    const auto sid = initialized_session();
+    ASSERT_FALSE(sid.empty());
+    auto returned = std::make_shared<std::promise<bool>>();
+    auto returned_future = returned->get_future();
+    srv->register_method("review/stop", [this, returned](const json &, const std::string &) {
+        srv->stop();
+        // The deferred shutdown is still running, but the server is already
+        // no longer running from the caller's point of view.
+        returned->set_value(srv->is_running());
+        return json::object();
+    });
+    auto accepted = cli->Post("/message?session_id=" + sid,
+                              rpc_request("review/stop").dump(), "application/json");
+    ASSERT_TRUE(accepted);
+    EXPECT_EQ(202, accepted->status);
+    ASSERT_EQ(std::future_status::ready, returned_future.wait_for(std::chrono::seconds(3)));
+    EXPECT_FALSE(returned_future.get());
+    ASSERT_TRUE(server_test_access::wait_for_stop_completion(*srv));
+    EXPECT_TRUE(srv->get_sessions().empty());
+    ASSERT_TRUE(srv->start(false));
+    EXPECT_FALSE(initialized_session().empty());
+    srv->stop();
+    EXPECT_FALSE(srv->is_running());
+    EXPECT_TRUE(srv->get_sessions().empty());
+}
+
+void destroy_server_from_its_own_callback() {
+    server::configuration conf;
+    conf.host = "127.0.0.1";
+    conf.port = 9590;
+    conf.session_timeout = 0;
+    auto *srv = new server(conf);
+    srv->register_method("review/destroy", [srv](const json &, const std::string &) {
+        delete srv;
+        return json::object();
+    });
+    if (!srv->start(false)) {
+        return;
+    }
+    httplib::Client cli(conf.host, conf.port);
+    auto init = cli.Post("/mcp", initialize_request().dump(), "application/json");
+    if (!init) {
+        return;
+    }
+    const httplib::Headers session = {
+        {"Mcp-Session-Id", init->get_header_value("Mcp-Session-Id")}};
+    cli.Post("/mcp", session,
+             rpc_request("notifications/initialized", json::object(), nullptr).dump(),
+             "application/json");
+    cli.Post("/mcp", session, rpc_request("review/destroy").dump(), "application/json");
+}
+
+// Destruction joins every server thread, so it cannot run on one of them.
+// Abort with the reason rather than free state those threads still use.
+TEST(LifecycleDeathTest, DestroyingServerFromItsOwnCallbackAborts) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH(destroy_server_from_its_own_callback(), "destroyed from one of its own threads");
 }
 
 #ifndef _WIN32
