@@ -193,6 +193,26 @@ srv.register_tool(echo, [](const mcp::json& args, const std::string& session_id)
 });
 ```
 
+#### Request context
+
+Handlers can take a `mcp::request_context` instead of a bare session id. It
+carries what the server knows about the request — protocol version, client
+name/version/capabilities, effective log level, remote address, JSON-RPC id and
+`params._meta` — and has matching `send_log` / `send_progress` / `is_cancelled`
+overloads:
+
+```cpp
+srv.register_tool(echo, [&srv](const mcp::json& args, const mcp::request_context& ctx) -> mcp::json {
+    srv.send_progress(ctx, ctx.meta.value("progressToken", mcp::json()), 0.5, 1.0);
+    return mcp::json::array({{{"type", "text"}, {"text", args["text"]}}});
+});
+```
+
+Prefer this form for new code. MCP 2026-07-28 drops protocol-level sessions and
+moves the same facts into per-request `_meta`; handlers written against
+`request_context` will not need to change when that path is added, while
+`(params, session_id)` handlers stay supported as adapters.
+
 ### Registering Prompts
 
 ```cpp
