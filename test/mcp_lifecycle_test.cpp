@@ -76,7 +76,12 @@ class LifecycleTest : public ::testing::Test {
         cli = std::make_unique<httplib::Client>(conf.host, conf.port);
         cli->set_read_timeout(3);
     }
-    void TearDown() override { srv->stop(); }
+    void TearDown() override {
+        if (srv) {
+            srv->stop();
+        }
+    }
+
     httplib::Result initialize(const json &req = initialize_request()) {
         return cli->Post("/mcp", req.dump(), "application/json");
     }
@@ -705,6 +710,21 @@ TEST_F(LifecycleTest, InvalidUtf8InResultIsReplacedNotDropped) {
     ASSERT_EQ(202, post(rpc_request("notifications/initialized", json::object(), nullptr)));
     ASSERT_EQ(202, post(rpc_request("review/bytes", json::object(), 6)));
     EXPECT_TRUE(sse.wait_for("\"id\":6"));
+}
+
+// Destroying a server after stop() must not run the whole shutdown again.
+TEST_F(LifecycleTest, StopAfterCompletedShutdownDoesNothing) {
+    testing::internal::CaptureStderr();
+    srv->stop();
+    srv->stop();
+    srv.reset();
+    const auto log = testing::internal::GetCapturedStderr();
+    size_t stops = 0;
+    for (auto at = log.find("MCP server stopped"); at != std::string::npos;
+         at = log.find("MCP server stopped", at + 1)) {
+        ++stops;
+    }
+    EXPECT_EQ(1u, stops);
 }
 
 void destroy_server_from_its_own_callback() {

@@ -695,6 +695,7 @@ bool server::start(bool blocking) {
     // failed instantly clear running_ and then have it overwritten with
     // true by this thread, latching "running" onto a dead server.
     running_ = true;
+    started_ = true;
 
     auto listener = std::make_shared<std::promise<bool>>();
     auto listened = listener->get_future();
@@ -770,7 +771,6 @@ void server::stop() {
 
     // Wait out any shutdown already running, re-checking after each join: a
     // callback can start another one while the lock is released.
-    bool joined_deferred = false;
     while (true) {
         stop_cv_.wait(lock, [this] { return !stop_in_progress_; });
         if (!deferred_stop_thread_.joinable()) {
@@ -780,10 +780,9 @@ void server::stop() {
         lock.unlock();
         finished.join();
         lock.lock();
-        joined_deferred = true;
     }
-    if (joined_deferred && !running_) {
-        return; // That shutdown did the work, and nothing restarted since.
+    if (!started_) {
+        return; // Never started, or a shutdown already completed since.
     }
     stop_in_progress_ = true;
     lock.unlock();
@@ -840,6 +839,7 @@ void server::stop_impl() {
     // what they use once stop() returns, so they must finish first. Nothing
     // can enqueue more: the HTTP workers that do are joined above.
     thread_pool_.wait_idle();
+    started_ = false;
     LOG_INFO("MCP server stopped");
 }
 

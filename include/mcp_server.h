@@ -737,6 +737,8 @@ private:
     };
     std::map<std::string, sse_thread> sse_threads_;
     std::atomic<bool> stop_in_progress_{false};
+    // From a start() that bound until the shutdown after it completes.
+    std::atomic<bool> started_{false};
     std::mutex stop_mutex_;
     std::condition_variable stop_cv_;
     std::thread deferred_stop_thread_;
