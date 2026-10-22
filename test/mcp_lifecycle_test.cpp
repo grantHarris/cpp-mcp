@@ -538,6 +538,38 @@ TEST_F(LifecycleTest, LegacyMethodCanRequestStopFromPoolWorker) {
     EXPECT_TRUE(srv->get_sessions().empty());
 }
 
+// A session whose only traffic is an open GET stream is in use. With the 30 s
+// keepalive and 30 s timeout defaults, the reaper closed it whenever a tick
+// fell between the keepalive deadline and the stream's next activity update.
+TEST_F(LifecycleTest, OpenGetStreamKeepsIdleSessionAlive) {
+    srv->stop();
+    conf.session_timeout = 1;
+    srv = std::make_unique<server>(conf);
+    ASSERT_TRUE(srv->start(false));
+    auto reaped = std::make_shared<std::promise<void>>();
+    auto reaped_future = reaped->get_future().share();
+    srv->register_session_cleanup("reaped", [reaped](const std::string &) {
+        try {
+            reaped->set_value();
+        } catch (const std::future_error &) {
+        }
+    });
+    const auto sid = initialized_session();
+    ASSERT_FALSE(sid.empty());
+    httplib::Client stream(conf.host, conf.port);
+    stream.set_read_timeout(60);
+    auto get = std::async(std::launch::async, [&] {
+        return stream.Get("/mcp", {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}},
+                          [](const char *, size_t) { return true; });
+    });
+    // Far longer than the 1 s timeout, far shorter than the 30 s keepalive.
+    EXPECT_EQ(std::future_status::timeout, reaped_future.wait_for(std::chrono::seconds(3)));
+    stream.stop();
+    get.wait();
+    // With no stream the session is idle again, and it must still expire.
+    EXPECT_EQ(std::future_status::ready, reaped_future.wait_for(std::chrono::seconds(5)));
+}
+
 void destroy_server_from_its_own_callback() {
     server::configuration conf;
     conf.host = "127.0.0.1";

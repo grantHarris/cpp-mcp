@@ -220,6 +220,10 @@ public:
                         return false;
                     }
                 }
+                // A connected stream is session activity. Otherwise a session
+                // whose only traffic is a GET waiting out a keepalive as long as
+                // the session timeout expires under the client.
+                last_activity_ = std::chrono::steady_clock::now();
             }
 
             if (closed_.load(std::memory_order_acquire) || superseded()) {
