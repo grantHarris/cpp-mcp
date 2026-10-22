@@ -470,7 +470,9 @@ public:
     server(const server::configuration& conf);   
     
     /**
-     * @brief Destructor
+     * @brief Destructor. Stops the server. It must not run on one of this
+     * server's own threads (a callback or hook): shutdown joins those threads,
+     * so that aborts the process with a message.
      */
     ~server();
     
@@ -482,9 +484,17 @@ public:
     bool start(bool blocking = true);
     
     /**
-     * @brief Stop the server. Calls from host callbacks request shutdown and
-     * return without waiting for that callback's own worker to exit. Calls
-     * from other threads wait until callbacks and session cleanup finish.
+     * @brief Stop the server.
+     *
+     * Runs every session's cleanup hooks, then waits for all running and
+     * accepted callbacks to return. From the start of shutdown is_cancelled()
+     * reports true, so handlers must return once cancelled, and neither
+     * handlers nor hooks may block on a thread that is itself calling stop().
+     *
+     * Called on one of this server's own threads (from a callback or hook), it
+     * starts the shutdown and returns at once, because waiting would join the
+     * calling thread. From any other thread it returns only when shutdown has
+     * finished, including a shutdown another call already started.
      */
     void stop();
     
@@ -679,7 +689,8 @@ public:
      * @brief Check if a request has been cancelled
      * @param request_id The JSON-RPC request ID to check
      * @param session_id The session that sent the request
-     * @return True if the request was cancelled via notifications/cancelled
+     * @return True if the request was cancelled via notifications/cancelled,
+     *         or the server is no longer running (for example, stopping)
      */
     bool is_cancelled(const json& request_id, const std::string& session_id) const;
 
@@ -917,7 +928,7 @@ private:
     std::map<std::string, session_open_handler> session_open_handler_;
 
     // Close session
-    void close_session(const std::string& session_id, bool force = false);
+    void close_session(const std::string& session_id);
 };
 
 } // namespace mcp

@@ -62,7 +62,7 @@ class LifecycleTest : public ::testing::Test {
         conf.port = next_port++;
         conf.max_sessions = 2;
         conf.session_timeout = 0;
-        conf.threadpool_size = 1;
+        conf.threadpool_size = 2;
         conf.http_thread_pool_size = 4;
         srv = std::make_unique<server>(conf);
         ASSERT_TRUE(srv->start(false));
@@ -83,6 +83,16 @@ class LifecycleTest : public ::testing::Test {
         auto notice = cli->Post("/mcp", {{"Mcp-Session-Id", sid}}, initialized.dump(),
                                 "application/json");
         return notice && notice->status == 202 ? sid : std::string{};
+    }
+    // Calls that block until their handler returns need their own connection.
+    std::future<httplib::Result> post_async(const std::string &path, const std::string &sid,
+                                            const json &body) {
+        return std::async(std::launch::async, [this, path, sid, body] {
+            httplib::Client client(conf.host, conf.port);
+            client.set_read_timeout(10);
+            return client.Post(path, {{"Mcp-Session-Id", sid}}, body.dump(),
+                               "application/json");
+        });
     }
     server::configuration conf;
     std::mutex cleanup_mutex;
@@ -298,54 +308,199 @@ TEST_F(LifecycleTest, SchemaSizeLimitsAcceptEveryIntegerEncoding) {
     }
 }
 
-TEST_F(LifecycleTest, StopWaitsForAcceptedLegacyCallbacksBeforeCleanup) {
+// stop() must not return while an accepted legacy callback is running or still
+// queued: a host frees what its callbacks use as soon as stop() returns.
+TEST_F(LifecycleTest, StopReturnsOnlyAfterAcceptedLegacyCallbacks) {
+    // One pool worker, so the notification queues behind the held method.
+    srv->stop();
+    conf.threadpool_size = 1;
+    srv = std::make_unique<server>(conf);
+    ASSERT_TRUE(srv->start(false));
     const auto sid = initialized_session();
     ASSERT_FALSE(sid.empty());
-    std::promise<void> entered, release;
-    auto entered_future = entered.get_future();
-    auto release_future = release.get_future().share();
-    std::atomic<bool> notification_ran{false};
-    std::atomic<bool> cleanup_after_notification{false};
-    srv->register_method("review/hold", [&](const json &, const std::string &) -> json {
-        entered.set_value();
-        release_future.wait();
+    struct shared_state {
+        std::promise<void> entered, release, hook_ran, stop_returned;
+        std::atomic<bool> stop_returned_while_held{false};
+        std::atomic<bool> notification_ran{false};
+    };
+    auto state = std::make_shared<shared_state>();
+    auto entered = state->entered.get_future();
+    auto hook_ran = state->hook_ran.get_future();
+    auto release = state->release.get_future().share();
+    auto stop_returned = state->stop_returned.get_future().share();
+    srv->register_method("review/hold", [state, release, stop_returned](const json &,
+                                                                        const std::string &) {
+        state->entered.set_value();
+        release.wait();
+        // Always a timeout when stop() is correct: it cannot return while
+        // this callback is still running.
+        state->stop_returned_while_held =
+            stop_returned.wait_for(std::chrono::milliseconds(200)) == std::future_status::ready;
         return json::object();
     });
-    srv->register_notification("notifications/review", [&](const json &, const std::string &) {
-        notification_ran = true;
+    srv->register_notification("notifications/review", [state](const json &, const std::string &) {
+        state->notification_ran = true;
     });
-    srv->register_session_cleanup("review", [&](const std::string &) {
-        cleanup_after_notification = notification_ran.load();
-    });
-    auto hold = cli->Post("/message?session_id=" + sid,
-                          rpc_request("review/hold").dump(), "application/json");
+    srv->register_session_cleanup("review",
+                                   [state](const std::string &) { state->hook_ran.set_value(); });
+    std::future<void> stopped;
+    struct release_on_exit {
+        std::shared_ptr<shared_state> state;
+        ~release_on_exit() {
+            try {
+                state->release.set_value();
+            } catch (const std::future_error &) {
+            }
+        }
+    } guard{state};
+
+    auto hold = cli->Post("/message?session_id=" + sid, rpc_request("review/hold").dump(),
+                          "application/json");
     ASSERT_TRUE(hold);
     ASSERT_EQ(202, hold->status);
-    ASSERT_EQ(std::future_status::ready, entered_future.wait_for(std::chrono::seconds(3)));
+    ASSERT_EQ(std::future_status::ready, entered.wait_for(std::chrono::seconds(3)));
     auto queued = cli->Post("/message?session_id=" + sid,
                             rpc_request("notifications/review", json::object(), nullptr).dump(),
                             "application/json");
     ASSERT_TRUE(queued);
     ASSERT_EQ(202, queued->status);
-    auto stopped = std::async(std::launch::async, [&] { srv->stop(); });
-    const auto premature = stopped.wait_for(std::chrono::milliseconds(0));
-    release.set_value();
+    stopped = std::async(std::launch::async, [this, state] {
+        srv->stop();
+        state->stop_returned.set_value();
+    });
+    // Cleanup hooks run before stop() waits, so a hook can cancel callbacks.
+    EXPECT_EQ(std::future_status::ready, hook_ran.wait_for(std::chrono::seconds(3)));
+    state->release.set_value();
     ASSERT_EQ(std::future_status::ready, stopped.wait_for(std::chrono::seconds(3)));
-    stopped.get();
-    EXPECT_EQ(std::future_status::timeout, premature);
-    EXPECT_TRUE(notification_ran);
-    EXPECT_TRUE(cleanup_after_notification);
+    EXPECT_FALSE(state->stop_returned_while_held);
+    EXPECT_TRUE(state->notification_ran);
     EXPECT_TRUE(srv->get_sessions().empty());
+}
+
+// A handler may wait for its session's cleanup hook to cancel it. stop() must
+// run that hook before it waits for the handler, or neither ever finishes.
+TEST_F(LifecycleTest, StopRunsCleanupHooksBeforeWaitingForCallbacks) {
+    const auto sid = initialized_session();
+    ASSERT_FALSE(sid.empty());
+    struct shared_state {
+        std::promise<void> entered, cancel;
+        std::atomic<bool> cancelled{false};
+    };
+    auto state = std::make_shared<shared_state>();
+    auto entered = state->entered.get_future();
+    auto cancel = state->cancel.get_future().share();
+    srv->register_method("review/wait", [state, cancel](const json &, const std::string &) {
+        state->entered.set_value();
+        state->cancelled =
+            cancel.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+        return json::object();
+    });
+    srv->register_session_cleanup("cancel", [state](const std::string &) {
+        try {
+            state->cancel.set_value();
+        } catch (const std::future_error &) {
+        }
+    });
+    auto call = post_async("/mcp", sid, rpc_request("review/wait"));
+    ASSERT_EQ(std::future_status::ready, entered.wait_for(std::chrono::seconds(3)));
+    auto stopped = std::async(std::launch::async, [this] { srv->stop(); });
+    EXPECT_EQ(std::future_status::ready, stopped.wait_for(std::chrono::seconds(3)));
+    EXPECT_TRUE(state->cancelled);
+}
+
+// Once stop() closes the listener no notifications/cancelled can arrive, so
+// is_cancelled() must report the shutdown itself to handlers that poll it.
+TEST_F(LifecycleTest, StopCancelsCallbacksThatPollIsCancelled) {
+    const auto sid = initialized_session();
+    ASSERT_FALSE(sid.empty());
+    struct shared_state {
+        std::promise<void> entered;
+        std::atomic<bool> cancelled{false};
+    };
+    auto state = std::make_shared<shared_state>();
+    auto entered = state->entered.get_future();
+    server *raw = srv.get();
+    srv->register_method("review/poll", [state, raw](const json &, const std::string &session) {
+        state->entered.set_value();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!state->cancelled && std::chrono::steady_clock::now() < deadline) {
+            state->cancelled = raw->is_cancelled(2, session);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return json::object();
+    });
+    auto accepted = cli->Post("/message?session_id=" + sid,
+                              rpc_request("review/poll", json::object(), 2).dump(),
+                              "application/json");
+    ASSERT_TRUE(accepted);
+    ASSERT_EQ(202, accepted->status);
+    ASSERT_EQ(std::future_status::ready, entered.wait_for(std::chrono::seconds(3)));
+    auto stopped = std::async(std::launch::async, [this] { srv->stop(); });
+    EXPECT_EQ(std::future_status::ready, stopped.wait_for(std::chrono::seconds(3)));
+    EXPECT_TRUE(state->cancelled);
+}
+
+// start(true) serves from the caller's thread. A stop() from another thread
+// must still wait for HTTP callbacks that are running.
+TEST_F(LifecycleTest, BlockingStopWaitsForRunningHttpCallbacks) {
+    srv->stop();
+    srv = std::make_unique<server>(conf);
+    struct shared_state {
+        std::promise<void> entered, release;
+    };
+    auto state = std::make_shared<shared_state>();
+    auto entered = state->entered.get_future();
+    auto release = state->release.get_future().share();
+    srv->register_method("review/hold", [state, release](const json &, const std::string &) {
+        state->entered.set_value();
+        release.wait();
+        return json::object();
+    });
+    auto serving = std::async(std::launch::async, [this] { return srv->start(true); });
+    std::future<void> stopped;
+    std::future<httplib::Result> call;
+    struct stop_on_exit {
+        server &srv;
+        std::shared_ptr<shared_state> state;
+        ~stop_on_exit() {
+            try {
+                state->release.set_value();
+            } catch (const std::future_error &) {
+            }
+            srv.stop();
+        }
+    } guard{*srv, state};
+
+    // Nothing signals when a blocking start() is accepting, so retry.
+    std::string sid;
+    for (int attempt = 0; attempt < 100 && sid.empty(); ++attempt) {
+        sid = initialized_session();
+        if (sid.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    ASSERT_FALSE(sid.empty());
+    call = post_async("/mcp", sid, rpc_request("review/hold"));
+    ASSERT_EQ(std::future_status::ready, entered.wait_for(std::chrono::seconds(3)));
+    stopped = std::async(std::launch::async, [this] { srv->stop(); });
+    EXPECT_EQ(std::future_status::timeout, stopped.wait_for(std::chrono::milliseconds(300)));
+    state->release.set_value();
+    ASSERT_EQ(std::future_status::ready, stopped.wait_for(std::chrono::seconds(3)));
+    ASSERT_EQ(std::future_status::ready, serving.wait_for(std::chrono::seconds(3)));
+    EXPECT_TRUE(serving.get());
 }
 
 TEST_F(LifecycleTest, CleanupHookCanRequestStopFromHttpWorker) {
     const auto sid = initialized_session();
     ASSERT_FALSE(sid.empty());
-    std::promise<void> returned;
-    auto returned_future = returned.get_future();
-    srv->register_session_cleanup("stop-from-hook", [&](const std::string &) {
+    auto returned = std::make_shared<std::promise<void>>();
+    auto returned_future = returned->get_future();
+    srv->register_session_cleanup("stop-from-hook", [this, returned](const std::string &) {
         srv->stop();
-        returned.set_value();
+        try {
+            returned->set_value();
+        } catch (const std::future_error &) {
+        }
     });
     auto deleted = cli->Delete("/mcp", {{"Mcp-Session-Id", sid}});
     ASSERT_TRUE(deleted);
@@ -358,11 +513,11 @@ TEST_F(LifecycleTest, CleanupHookCanRequestStopFromHttpWorker) {
 TEST_F(LifecycleTest, LegacyMethodCanRequestStopFromPoolWorker) {
     const auto sid = initialized_session();
     ASSERT_FALSE(sid.empty());
-    std::promise<void> returned;
-    auto returned_future = returned.get_future();
-    srv->register_method("review/stop", [&](const json &, const std::string &) -> json {
+    auto returned = std::make_shared<std::promise<void>>();
+    auto returned_future = returned->get_future();
+    srv->register_method("review/stop", [this, returned](const json &, const std::string &) {
         srv->stop();
-        returned.set_value();
+        returned->set_value();
         return json::object();
     });
     auto accepted = cli->Post("/message?session_id=" + sid,
@@ -377,6 +532,39 @@ TEST_F(LifecycleTest, LegacyMethodCanRequestStopFromPoolWorker) {
     srv->stop();
     EXPECT_FALSE(srv->is_running());
     EXPECT_TRUE(srv->get_sessions().empty());
+}
+
+void destroy_server_from_its_own_callback() {
+    server::configuration conf;
+    conf.host = "127.0.0.1";
+    conf.port = 9590;
+    conf.session_timeout = 0;
+    auto *srv = new server(conf);
+    srv->register_method("review/destroy", [srv](const json &, const std::string &) {
+        delete srv;
+        return json::object();
+    });
+    if (!srv->start(false)) {
+        return;
+    }
+    httplib::Client cli(conf.host, conf.port);
+    auto init = cli.Post("/mcp", initialize_request().dump(), "application/json");
+    if (!init) {
+        return;
+    }
+    const httplib::Headers session = {
+        {"Mcp-Session-Id", init->get_header_value("Mcp-Session-Id")}};
+    cli.Post("/mcp", session,
+             rpc_request("notifications/initialized", json::object(), nullptr).dump(),
+             "application/json");
+    cli.Post("/mcp", session, rpc_request("review/destroy").dump(), "application/json");
+}
+
+// Destruction joins every server thread, so it cannot run on one of them.
+// Abort with the reason rather than free state those threads still use.
+TEST(LifecycleDeathTest, DestroyingServerFromItsOwnCallbackAborts) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH(destroy_server_from_its_own_callback(), "destroyed from one of its own threads");
 }
 
 #ifndef _WIN32
